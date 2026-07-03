@@ -25,5 +25,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % os.environ.get('PORT','8000'))" || exit 1
 
-# Apply DB migrations, then start the server bound to the platform-provided $PORT.
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Start the server bound to the platform-provided $PORT. The app creates its schema
+# on startup via Base.metadata.create_all() (see app/main.py); Alembic migrations here
+# are incremental patches, not a from-scratch builder, so we do NOT run them on boot.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
