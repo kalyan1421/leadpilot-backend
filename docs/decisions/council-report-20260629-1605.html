@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM Council — LeadPilot Stack Review</title>
+<style>
+  :root{--green:#22c55e;--amber:#f59e0b;--red:#ef4444;--blue:#3b82f6;--ink:#1a1a1a;--mut:#6b7280;--line:#e5e7eb;}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:var(--ink);
+       background:#f7f8fa;margin:0;line-height:1.55;}
+  .wrap{max-width:820px;margin:0 auto;padding:28px 20px 64px;}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:20px}
+  .badge{display:inline-block;padding:8px 16px;border-radius:999px;font-weight:700;font-size:15px;color:#fff}
+  .badge.mh{background:linear-gradient(90deg,var(--green),var(--amber))}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin:14px 0;
+        box-shadow:0 1px 3px rgba(0,0,0,.04)}
+  h2{font-size:17px;margin:0 0 10px;padding-left:10px;border-left:4px solid var(--blue)}
+  h2.ok{border-color:var(--green)} h2.warn{border-color:var(--amber)} h2.bad{border-color:var(--red)}
+  .q{background:#eef2ff;border:1px solid #c7d2fe;border-radius:12px;padding:14px 16px;font-size:14px;color:#3730a3}
+  table{width:100%;border-collapse:collapse;margin:6px 0;font-size:13px}
+  th{background:#1f2937;color:#fff;text-align:left;padding:7px 9px;font-size:12px}
+  td{border-bottom:1px solid var(--line);padding:7px 9px;vertical-align:top}
+  tr:nth-child(even) td{background:#fafafa}
+  .pos-against{color:var(--red);font-weight:600}.pos-for{color:var(--green);font-weight:600}
+  .pos-reframe{color:var(--blue);font-weight:600}.pos-skept{color:var(--amber);font-weight:600}
+  details{background:#fff;border:1px solid var(--line);border-radius:12px;padding:6px 14px;margin:10px 0}
+  summary{cursor:pointer;font-weight:600;padding:8px 0}
+  details p{font-size:13px;color:#374151}
+  ul{margin:6px 0 6px 2px;padding-left:18px} li{margin:4px 0;font-size:14px}
+  .foot{color:var(--mut);font-size:12px;text-align:center;margin-top:26px}
+  code{background:#f1f3f5;padding:1px 5px;border-radius:4px;font-size:12px}
+  .pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;background:#ecfdf5;color:#047857;margin-left:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>🏛️ LLM Council Verdict — LeadPilot AI Stack</h1>
+  <div class="sub">Full Council (5 advisors · anonymized peer review · Devil's Advocate · chairman) · 2026-06-29 · Mode: Full</div>
+
+  <div class="card" style="text-align:center">
+    <span class="badge mh">Council Confidence: MEDIUM–HIGH</span>
+    <p style="font-size:14px;color:#374151;margin:12px 0 0">
+      Near-unanimous on the <b>diagnosis</b> (don't treat AI scores as ground truth; use 105B; trust Sarvam for
+      Indic STT/language, not fine-grained reasoning) — but a strong Devil's Advocate legitimately reframed
+      <b>how much rigor is needed before shipping</b>, which staged the recommendation by maturity.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="q"><b>The question:</b> Is the LeadPilot stack — code, techniques, API strategy, product features, outputs —
+    genuinely 2026 industry best-practice for production? Specifically: (a) sarvam-30b vs 105b for the analysis;
+    (b) can the business <b>trust</b> Sarvam's AI analysis enough to show scores to telecallers/founders and decide on them?
+    Stack: Python/FastAPI + Next.js + Postgres; <b>Sarvam-only</b> pipeline (Saaras v3 diarized STT → forced
+    tool-calling structured analysis, decomposed + map-reduce → translation + memory; deterministic score aggregation).</div>
+  </div>
+
+  <h2 class="ok">✅ Where the Council Agrees (high signal)</h2>
+  <div class="card"><ul>
+    <li><b>The <i>code &amp; techniques</i> are genuinely 2026 best-practice.</b> Forced tool-calling (schema-locked JSON),
+      task decomposition, map-reduce chunking, deterministic Python aggregation over LLM signals — all advisors treated
+      this layer as sound. This is the strong part of the build.</li>
+    <li><b>Use <code>sarvam-105B</code>, not 30B — unconditionally.</b> Cost delta is noise (~₹0.1–0.25/call vs ₹45/hr STT);
+      105B is materially better, especially on Indian languages. (Contrarian, Expansionist, Executor explicit; none dissented.)</li>
+    <li><b>Trust Sarvam for what it's SOTA at:</b> Indic speech-to-text + diarization, language comprehension, extraction,
+      BANT/entity tagging, code-mixed sentiment <i>direction</i>, and "what happened" summaries.</li>
+    <li><b>Do NOT present fine-grained numeric scores as truth.</b> A 0–20 "Closing: 12" from a model that scores 18/100 on
+      general reasoning is false precision. Attach the <b>supporting quote</b> to every score so it's auditable.
+      (First Principles, Outsider, Contrarian converged independently.)</li>
+  </ul></div>
+
+  <h2 class="warn">⚔️ Where the Council Clashes (real uncertainty)</h2>
+  <div class="card"><ul>
+    <li><b>How much validation/infra before shipping?</b> The Contrarian/Executor camp says: build a human-labeled gold set
+      + durable queue + paid tier <i>before</i> any paying customer. The Devil's Advocate says: that's Series-A infra on a
+      pre-PMF pilot — ship directional scores <i>with quotes</i> now and build the gold set <i>from</i> production traffic.</li>
+    <li><b>Bands vs raw numbers.</b> First Principles wants 0–20 collapsed into strong/ok/weak bands; the Devil's Advocate
+      counters that banding may destroy the week-over-week signal telecallers and founders actually want to track.</li>
+  </ul></div>
+
+  <h2 class="bad">🔎 Blind Spots the Council Caught (peer review — the most valuable layer)</h2>
+  <div class="card"><ul>
+    <li><b>Employment-law &amp; DPDP consent exposure.</b> Ranking/judging humans on AI output in India implicates consent for
+      recording+analysis, the right to contest a decision, and labor-dispute risk. Flagged by 4 of 5 reviewers as the
+      top universal miss. <span class="pill">irreversible</span></li>
+    <li><b>Non-uniform WER → systematic bias.</b> 19.3% WER isn't flat noise — ASR fails hardest on code-mixed, accented,
+      rural-dialect, low-SNR calls, which correlate with specific reps/regions. So scores are <i>biased</i> against certain
+      agents, not just noisy — and a uniformly-sampled gold set wouldn't even detect it.</li>
+    <li><b>STT→LLM error compounding.</b> You can't score above transcript accuracy; nobody measured Sarvam's <i>actual</i>
+      WER on <i>your</i> code-mixed telephony audio, and low-confidence transcripts should be routed away from scoring.</li>
+    <li><b>Goodhart gaming.</b> Once the rubric is known, reps optimize to trigger keywords rather than sell better.</li>
+    <li><b>Drift + recurring eval cost.</b> "Validated today" ≠ valid in 3 months as models/products change; eval is ongoing, not a one-time gate.</li>
+    <li><b>Rater reliability.</b> A gold set with poor inter-rater agreement just launders human disagreement into a fake benchmark.</li>
+  </ul></div>
+
+  <h2>🥊 The Devil's Advocate Check</h2>
+  <div class="card">
+    <p style="font-size:14px">The challenge <b>partially succeeded — and that's a feature.</b> It correctly argued that the
+    gold-set / durable-queue / de-precision bar is over-engineering for a <i>pilot</i> (BackgroundTasks survives dozens of
+    calls/day; Gong/Chorus shipped directional scores with no public gold set; closed-domain QA ≠ open reasoning, so the
+    18/100 index is less damning than the Contrarian implied). But it <b>conceded the load-bearing safety points</b>: DPDP
+    consent and a hard "never make a pay/firing decision on the score alone" guardrail are <i>irreversible liability</i>, not
+    paralysis — and Goodhart gaming is real. Net effect: the recommendation is <b>staged by maturity</b> rather than "do everything first."</p>
+  </div>
+
+  <h2 class="ok">🧭 The Recommendation</h2>
+  <div class="card">
+    <p style="font-size:14px"><b>Ship it — the engineering is 2026-standard — but never present AI scores as a verdict, and stage trust by maturity.</b></p>
+    <ul>
+      <li><b>(a) 30b vs 105b → 105B.</b> Settled. Use 30B only as a cheap map-reduce chunk-worker if throughput demands it.</li>
+      <li><b>(b) Can you trust Sarvam's analysis? Split it:</b> <span style="color:var(--green)"><b>Yes</b></span> for STT/diarization/
+        language/extraction/summaries (Indic SOTA). <span style="color:var(--red)"><b>Not as ground truth</b></span> for
+        fine-grained numeric scores — show them as <i>evidence-backed, directional</i> coaching signals (quote attached),
+        framed as deterministic aggregation over schema-locked extractions, not "the AI's opinion of you."</li>
+      <li><b>Pilot (now, design partners):</b> ship directional scores <i>with the supporting quote</i>; collect labels from
+        production to build the gold set; keep BackgroundTasks. Velocity over perfection.</li>
+      <li><b>Before scale / paying volume:</b> durable queue (replace BackgroundTasks), paid Sarvam tier (kill free-key rotation),
+        <code>contact_id</code> DB index, per-dimension gold-set acceptance gate, drift monitoring, cap per-turn sentiment.</li>
+      <li><b>Non-negotiable from day one (irreversible):</b> DPDP consent for recording+analysis; a hard guardrail that scores are a
+        <i>coaching aid, never the basis for a pay/firing decision</i> (human-in-the-loop + appeal path); watch for rubric gaming.</li>
+    </ul>
+  </div>
+
+  <h2 class="ok">🎯 The One Thing to Do First</h2>
+  <div class="card">
+    <p style="font-size:14px"><b>Attach the supporting transcript quote (with timestamp) to every score dimension in the Score tab —
+    this week.</b> It's a small change that turns each number from "trust me" into auditable evidence; it's the single fix every
+    advisor <i>and</i> the Devil's Advocate agreed on, and it neutralizes the false-precision and "rep can't argue with it" risks at once.
+    Pair it with a one-line "coaching aid, not a performance verdict" + consent disclaimer.</p>
+  </div>
+
+  <h2 class="warn">🚨 What to Watch For (tripwires)</h2>
+  <div class="card"><ul>
+    <li>Design-partner reps dispute a score and are right &gt;~20% of the time → that dimension isn't trustworthy; pull it to a band or hide it.</li>
+    <li>A score has no quote to back it → it's unfalsifiable; don't display it.</li>
+    <li>Anyone proposes using the score in a pay/promotion/firing decision → STOP. Human-in-the-loop + appeal required (labor-law tripwire).</li>
+    <li>Measured WER on your real code-mixed audio is materially worse for specific reps/regions → systematic bias; don't rank <i>across</i> reps until corrected.</li>
+  </ul></div>
+
+  <h2>📊 Advisor Alignment Matrix</h2>
+  <div class="card">
+  <table>
+    <tr><th>Advisor</th><th>Position</th><th>Conf.</th><th>Key point</th></tr>
+    <tr><td>Contrarian ⭐</td><td class="pos-against">Don't trust yet</td><td>High</td><td>Schema-valid JSON ≠ correct; a weak reasoner emits structured wrong scores. Build a gold set, measure per-dimension MAE.</td></tr>
+    <tr><td>First Principles</td><td class="pos-reframe">Reframe</td><td>High</td><td>Stop selling false precision; bands + supporting evidence; spend 105B on summaries/memory.</td></tr>
+    <tr><td>Expansionist</td><td class="pos-for">For (strategic)</td><td>High</td><td>The keyword→ad loop is a sovereign vernacular intent graph — the real 10x. 105B everywhere.</td></tr>
+    <tr><td>Outsider</td><td class="pos-skept">Skeptical</td><td>—</td><td>Scores look precise but rest on 1-in-5 word errors + an even 20×5 rubric that smells arbitrary; show the quote.</td></tr>
+    <tr><td>Executor</td><td class="pos-skept">Not yet (infra)</td><td>High</td><td>BackgroundTasks isn't a queue; free-key/rate-limit risk; DB scans. Durable queue + paid tier before customers.</td></tr>
+  </table>
+  <p style="font-size:12px;color:var(--mut)">⭐ = unanimous "strongest" pick across all 5 anonymized peer reviewers.</p>
+  </div>
+
+  <details><summary>Advisor full responses</summary>
+    <p><b>The Contrarian:</b> Sarvam's 18-on-the-index LLM is the fatal flaw, and forced tool-calling makes it more dangerous — schema-valid JSON is not correct JSON; a weak reasoner confidently emits perfectly-structured wrong scores. Scoring is pure reasoning (where Sarvam is weakest); Indic/STT dominance is irrelevant once the call is text. 105B over 30B unconditionally, but both are weak judges. Don't trust yet — you validated the pipeline runs, not that scores are right; one Telugu call proves nothing. One bad score kills trust forever. Before launch: human-labeled gold set (50–100 calls, 2 raters), measure correlation/MAE per dimension, ship only dimensions that clear a bar; mark others beta/hidden.</p>
+    <p><b>The First Principles Thinker:</b> Solving the wrong problem — optimizing "a defensible 0–20 closing score" when the job is "help the team make one better decision per day." False precision on an 18-index model = the trust trap. Ask which outputs are load-bearing vs decoration. Trust transcription, sentiment direction, "what happened" summaries; not fine-grained numeric scores as truth. Collapse 0–20 into bands + supporting quote — the number can't be "wrong," only the auditable evidence. Then 30b-vs-105b stops mattering; spend the 105B/Indic edge on summaries and memory.</p>
+    <p><b>The Expansionist:</b> The biggest upside isn't scoring — it's the keyword→ad loop becoming a proprietary, sovereign Indian-language intent graph nobody else can build. 105B everywhere. Trust Sarvam for extraction/classification/BANT/code-mixed sentiment; present the 5-dim score as deterministic aggregation over schema-locked extractions. Every 19.3% WER SOTA transcript is a vernacular dataset Google/Meta can't see; resell as QA/coaching, a telecaller index, or a fine-tuned vertical SLM; sovereignty is the BFSI/gov moat. You're building the intent layer for vernacular India.</p>
+    <p><b>The Outsider:</b> The scores look precise but rest on a foundation openly admitted to be shaky, and nobody told the salesperson. One in five words may be wrong, then a "73/100" appears — why not 71? A rep with 12/20 Closing can't see what 11 or 13 looks like, so can't learn. The even 20×5 rubric smells arbitrary. Bosses will judge jobs on numbers built on misheard words + an admittedly weak reasoner. Build trust: show the quote behind each score, admit uncertainty, stop presenting fuzzy judgment as a hard number.</p>
+    <p><b>The Executor:</b> Not production-ready. BackgroundTasks isn't a durable queue — a restart drops in-flight calls (data loss). 3 free starter keys / 4096 cap / unknown rate limits = billing+ToS landmine + 429s with no backpressure. Full-scan-then-filter DB dies at 50k calls. Batch STT + many per-turn LLM calls = unbounded latency/cost. Monday order: durable queue first; buy a paid Sarvam tier with backoff + semaphore; add a contact_id index + pagination; cap per-turn sentiment + set an SLA. Keep 105B. Don't ship until the queue and paid tier land.</p>
+  </details>
+
+  <details><summary>Peer review highlights &amp; tallies</summary>
+    <p><b>Strongest (5/5 unanimous): the Contrarian</b> — the only advisor who turned "trust" into something <i>measurable</i> (gold set + per-dimension MAE acceptance gate), separating "the pipeline runs" from "the scores are right."</p>
+    <p><b>Most-flagged blind spots:</b> the Contrarian's own gap = production reliability (it never asks if the system stays up — the Executor's queue/DB/rate-limit risks). The Expansionist = monetizes/resells output it never validated.</p>
+    <p><b>Universal misses (what ALL advisors skipped):</b> (1) employment-law + DPDP consent for ranking humans on AI; (2) non-uniform WER → systematic bias against specific reps/regions; (3) STT→LLM error compounding + nobody measured real WER on your audio; (4) Goodhart gaming of a known rubric; (5) post-launch drift + recurring eval cost; (6) rater reliability of the gold set itself.</p>
+  </details>
+
+  <details><summary>Devil's Advocate challenge (full)</summary>
+    <p>Point 1 (gold set): the hidden assumption is that measuring correlation requires labeled data BEFORE shipping — false. Gong/Chorus shipped directional scores with no public gold set; the quote makes the score auditable in-context. Build the gold set FROM production traffic. Point 2 (false precision): overblown — call QA is closed-domain extraction over a known rubric, not open reasoning; the 18/100 general score is less relevant, and banding may destroy the week-over-week signal users want. Point 4 (not production-ready): for a pilot with design partners, durable queue + paid tier + index is Series-A infra on a pre-PMF experiment; BackgroundTasks survives dozens of calls/day. <b>BUT</b> the consensus survives where it matters most: DPDP/labor-law consent and the "don't fire on the score" guardrail are irreversible liability, not paralysis — and Goodhart gaming is real. So: ship directional scores with quotes fast; skip the gold set for now; do NOT skip consent and the human-in-the-loop guardrail.</p>
+  </details>
+
+  <div class="foot">
+    Counciled: "Is the LeadPilot Sarvam-only stack 2026 best-practice + production-trustworthy? 30b vs 105b?" ·
+    Full Council · 5 advisors + 5 peer reviews + Devil's Advocate + chairman · 2026-06-29<br>
+    Grounded on verified research (Artificial Analysis Intelligence Index; Saaras v3 IndicVoices WER) and a live end-to-end Telugu-call test.
+  </div>
+
+</div>
+</body>
+</html>

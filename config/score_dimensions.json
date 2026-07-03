@@ -1,0 +1,8 @@
+{
+  "_comment": "Per-dimension TRUST status consumed by GET /api/calls/{id}/score. A dimension stays 'beta' until gold_set_eval.py shows it clears the acceptance bar vs human raters; then promote to 'validated'. Use 'hidden' to suppress a dimension entirely. Default (unlisted) = beta.",
+  "opening": "beta",
+  "discovery": "beta",
+  "pitch": "beta",
+  "objection_handling": "beta",
+  "closing": "beta"
+}

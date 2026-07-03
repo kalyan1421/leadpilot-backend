@@ -1,0 +1,131 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.eslintcache
+.node_repl_history
+*.tgz
+
+# React build
+webapp/frontend/build/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+# But keep these for reference
+!.env.production
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database
+*.db
+*.sqlite3
+
+# Transcripts and data
+transcripts/
+reports/*.csv
+reports/*.xlsx
+reports/*.json
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# Docker
+.dockerignore.local
+
+# Kubernetes secrets
+k8s/secrets/
+k8s/*.secret.yaml
+
+# Additional test/coverage files
+*.coverage.xml
+coverage.xml
+htmlcov/
+
+# Playwright
+.playwright-mcp/
+
+# Temporary logs
+backend-logs.txt
+*-logs.txt
+
+# Test artifacts
+test_single_redaction.py
+metrics_extraction_evaluation.py
+
+# Local scripts
+generate_shubham_metrics_csv.py
+recover_bolna_executions.py
+schedule-agent-tasks.sh
+
+# Claude Config
+CLAUDE.md
+.claude/
+
+# Next.js build artifacts
+frontend/.next/
+frontend/out/
+*.tsbuildinfo
+# cleanup safety
+.venv/
+node_modules/
+.next/
+__pycache__/
+*.pyc
+
+# runtime data / generated (not committed)
+local_storage/
+Audio/
+gold_set.json
+outputs/
+*.log
