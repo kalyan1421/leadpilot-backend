@@ -1,5 +1,7 @@
 """Pydantic schemas for the org/user/auth module."""
 
+from typing import List, Optional
+
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -35,14 +37,39 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
-class RenameOrgRequest(BaseModel):
-    name: str = Field(min_length=2, max_length=255)
+class OrgProfileRequest(BaseModel):
+    """All fields optional — the onboarding wizard sends everything at once on
+    launch, the settings page sends only what changed on an edit."""
+
+    name: Optional[str] = Field(None, min_length=2, max_length=255)
+    industry: Optional[str] = None
+    website_url: Optional[str] = None
+    services: Optional[List[str]] = None
+    pricing_min: Optional[int] = None
+    pricing_max: Optional[int] = None
+    target_audience: Optional[str] = None
+    competitors: Optional[List[str]] = None
+    brand_voice: Optional[str] = None
+    languages: Optional[List[str]] = None
+    usps: Optional[List[str]] = None
+    monthly_revenue_target: Optional[int] = None
 
 
-class OrgResponse(BaseModel):
+class OrgProfileResponse(BaseModel):
     id: str
     name: str
     slug: str
+    industry: Optional[str] = None
+    website_url: Optional[str] = None
+    services: Optional[List[str]] = None
+    pricing_min: Optional[int] = None
+    pricing_max: Optional[int] = None
+    target_audience: Optional[str] = None
+    competitors: Optional[List[str]] = None
+    brand_voice: Optional[str] = None
+    languages: Optional[List[str]] = None
+    usps: Optional[List[str]] = None
+    monthly_revenue_target: Optional[int] = None
 
     class Config:
         from_attributes = True

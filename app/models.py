@@ -1,6 +1,18 @@
 """Database models for the Voice Summary application."""
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -15,6 +27,26 @@ class Organization(Base):
     id = Column(String(255), primary_key=True, index=True)
     name = Column(String(255), nullable=False)
     slug = Column(String(255), nullable=False, unique=True, index=True)
+
+    # Organisation Knowledge Base — grounds every AI decision (scoring relevance,
+    # follow-up tone, script generation) in what this specific business actually
+    # sells. Populated by the founder onboarding wizard; all nullable since no
+    # existing org has these yet.
+    industry = Column(String(100), nullable=True)
+    website_url = Column(String(500), nullable=True)
+    services = Column(JSON, nullable=True)          # [str, ...]
+    pricing_min = Column(Integer, nullable=True)
+    pricing_max = Column(Integer, nullable=True)
+    target_audience = Column(Text, nullable=True)
+    competitors = Column(JSON, nullable=True)        # [str, ...]
+    brand_voice = Column(String(50), nullable=True)
+    languages = Column(JSON, nullable=True)          # [str, ...]
+    usps = Column(JSON, nullable=True)               # [str, ...]
+
+    # Revenue goal tracking — drives the Monthly Goal gauge and the revenue
+    # target line on the founder dashboard. Nullable: an org with no target set
+    # simply gets no target-based breakdown (never a fabricated number).
+    monthly_revenue_target = Column(Integer, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -34,6 +66,7 @@ class User(Base):
     org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
 
     email = Column(String(255), nullable=False, unique=True, index=True)
+    phone = Column(String(20), nullable=True, unique=True, index=True)
     hashed_password = Column(String(255), nullable=False)
     name = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, default="founder")  # founder / ad_manager / telecaller
@@ -54,6 +87,8 @@ class AudioCall(Base):
     __tablename__ = "audio_calls"
 
     call_id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
+    telecaller_id = Column(String(255), ForeignKey("users.id"), nullable=True, index=True)
     timestamp = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
     )
@@ -92,6 +127,7 @@ class ProcessingJob(Base):
     __tablename__ = "processing_jobs"
 
     id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
     call_id = Column(String(255), nullable=False, index=True)
     audio_path = Column(Text, nullable=True)
     stage = Column(String(20), default="queued")                 # queued/transcribe/analyse/memory/done
@@ -114,6 +150,7 @@ class LeadAnalysis(Base):
     __tablename__ = "lead_analysis"
 
     id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
     call_id = Column(String(255), ForeignKey("audio_calls.call_id"), nullable=False, unique=True, index=True)
 
     # Core analysis outputs
@@ -137,7 +174,7 @@ class LeadAnalysis(Base):
     agent_debrief = Column(JSON, nullable=True)        # {strengths, improvements, 5 scores, total_score}
 
     # Status
-    status = Column(String(20), default="pending", index=True)   # pending / processing / completed / failed
+    status = Column(String(20), default="pending", index=True)   # pending / processing / completed / not_relevant / failed
     error = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -163,12 +200,24 @@ class Lead(Base):
 
     id = Column(String(255), primary_key=True, index=True)
     org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
+    assigned_to = Column(String(255), ForeignKey("users.id"), nullable=True, index=True)
     contact_key = Column(String(255), nullable=False, unique=True, index=True)
     name = Column(String(255), nullable=True)
     phone = Column(String(40), nullable=True, index=True)
     reason = Column(Text, nullable=True)
     source = Column(String(50), nullable=True)
     status = Column(String(30), default="new")  # new/contacted/qualified/converted/lost
+    pipeline_stage = Column(String(30), nullable=False, default="New", index=True)
+    # kanban board position: New/Assigned/Contacted/Interested/Proposal Sent/
+    # Negotiation/Closed Won/Closed Lost/Junk — distinct from `status` above,
+    # which is the coarser AI-derived verdict category used by dedupe/inbox.
+
+    # Revenue — set when a founder/telecaller moves a lead to "Closed Won" (see
+    # the kanban stage-update endpoint). closed_at is cleared if the lead is
+    # ever moved out of Closed Won again, so revenue reports never double-count
+    # a lead that was reopened and hasn't re-closed.
+    deal_value = Column(Integer, nullable=True)
+    closed_at = Column(DateTime(timezone=True), nullable=True, index=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -188,6 +237,7 @@ class MemoryBubble(Base):
     __tablename__ = "memory_bubbles"
 
     id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
     contact_key = Column(String(255), nullable=False, unique=True, index=True)  # phone in prod
 
     total_calls = Column(Integer, default=0)
@@ -208,6 +258,28 @@ class MemoryBubble(Base):
 
     def __repr__(self):
         return f"<MemoryBubble(contact_key='{self.contact_key}', calls={self.total_calls})>"
+
+
+class Attendance(Base):
+    """Telecaller check-in/check-out attendance — timestamp only (no geolocation, no
+    photo; that's an explicit product decision). One row per user per calendar day."""
+
+    __tablename__ = "attendance"
+
+    id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
+    user_id = Column(String(255), ForeignKey("users.id"), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    check_in_at = Column(DateTime(timezone=True), nullable=True)
+    check_out_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("user_id", "date", name="uq_attendance_user_date"),)
+
+    def __repr__(self):
+        return f"<Attendance(user_id='{self.user_id}', date='{self.date}')>"
 
 
 

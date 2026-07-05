@@ -6,9 +6,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.attendance import router as attendance_router
 from app.api.auth import router as auth_router
 from app.api.calls import router as calls_router
 from app.api.calls import intel_router
+from app.api.dashboard import router as dashboard_router
+from app.api.team import router as team_router
 from app.config import settings
 from app.database import engine
 from app.models import Base
@@ -36,10 +39,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include API routers
+# Include API routers.
+# dashboard_router MUST come before intel_router: both mount under /api, and
+# intel_router's GET /leads/{contact_key} would otherwise greedily match
+# GET /leads/board (treating "board" as a contact key) — same pitfall as the
+# existing /leads/dedupe-before-/leads/{contact_key} ordering below.
 app.include_router(auth_router)
+app.include_router(dashboard_router)
 app.include_router(calls_router)
 app.include_router(intel_router)
+app.include_router(team_router)
+app.include_router(attendance_router)
 
 
 @app.on_event("startup")
