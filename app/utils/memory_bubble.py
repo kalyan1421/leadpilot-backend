@@ -29,6 +29,13 @@ from app.utils.sarvam import sarvam_extract
 
 logger = logging.getLogger(__name__)
 
+# Bounds the memory-bubble prompt to the most recent N calls regardless of how many
+# total calls a contact has had. Without this, a high-touch lead's every new call
+# re-sent the full history to the LLM, so both latency and cost grew unbounded with
+# call count. Older facts aren't lost — they were already folded into the fact list
+# by earlier builds; this just stops re-deriving them from raw history every time.
+_MAX_MEMORY_CALLS = 15
+
 # Categories shown in the Figma memory bubble (colored dots map to these)
 FACT_CATEGORIES = [
     "budget",          # green   — "Confirmed budget ₹80L–₹1Cr"
@@ -41,7 +48,7 @@ FACT_CATEGORIES = [
 ]
 
 _MEMORY_PROMPT = """You are building a cumulative MEMORY BUBBLE for a sales prospect.
-You are given the AI analysis of every call made to this person so far, in order.
+You are given the AI analysis of the {shown_desc} calls made to this person so far, in order.
 Synthesise a single, deduplicated, up-to-date memory of what matters about THIS prospect.
 
 When a later call updates an earlier fact (budget changed, objection resolved), keep ONLY
@@ -122,14 +129,23 @@ class MemoryBubbleBuilder:
         if not calls:
             return self._empty(contact_key)
 
-        calls_block = self._format_calls(calls)
+        total_calls = len(calls)
+        recent_calls = calls[-_MAX_MEMORY_CALLS:]
+        # Absolute call number of recent_calls[0], so "CALL N" labels (and the
+        # call_index the LLM attributes facts to) stay correct against the full
+        # history even though only the tail of it is shown in the prompt.
+        start_index = total_calls - len(recent_calls) + 1
+        shown_desc = "most recent 15" if total_calls > len(recent_calls) else "every"
+        calls_block = self._format_calls(recent_calls, start_index=start_index)
 
         try:
-            logger.info(f"Building memory bubble for {contact_key} from {len(calls)} call(s)")
+            logger.info(
+                f"Building memory bubble for {contact_key} from {len(recent_calls)}/{total_calls} call(s)"
+            )
             data = sarvam_extract(
                 [
                     {"role": "system", "content": "You synthesise cumulative sales memory for a prospect."},
-                    {"role": "user", "content": _MEMORY_PROMPT.format(calls_block=calls_block)},
+                    {"role": "user", "content": _MEMORY_PROMPT.format(calls_block=calls_block, shown_desc=shown_desc)},
                 ],
                 schema=_MEMORY_SCHEMA, tool_name="record_memory", model=self.model, max_tokens=2000,
             )
@@ -137,10 +153,10 @@ class MemoryBubbleBuilder:
                 return self._empty(contact_key)
 
             data["contact_key"] = contact_key
-            data["total_calls"] = len(calls)
+            data["total_calls"] = total_calls
             data["last_call_id"] = calls[-1].get("call_id")
             data["last_call_at"] = calls[-1].get("timestamp")
-            data["facts"] = self._sanitise_facts(data.get("facts", []), len(calls))
+            data["facts"] = self._sanitise_facts(data.get("facts", []), total_calls)
             return data
         except Exception as e:
             logger.error(f"Memory bubble build failed for {contact_key}: {e}", exc_info=True)
@@ -149,10 +165,11 @@ class MemoryBubbleBuilder:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _format_calls(calls: List[Dict[str, Any]]) -> str:
+    def _format_calls(calls: List[Dict[str, Any]], start_index: int = 1) -> str:
         """Compact each call's analysis into a short block (never raw transcript)."""
         blocks = []
-        for i, c in enumerate(calls, 1):
+        for offset, c in enumerate(calls):
+            i = start_index + offset
             a = c.get("analysis") or {}
             summary = a.get("call_summary") or {}
             ents = a.get("entities") or {}
@@ -275,6 +292,28 @@ def contact_key_from_call_id(call_id: str) -> str:
     s = re.sub(r"_[0-9a-f]{6,}$", "", s)   # strip trailing uuid fragment
     s = re.sub(r"_\d+\.\d+$", "", s)       # strip version marker like _1.2
     return s or call_id
+
+
+def normalize_phone(phone: Optional[str]) -> str:
+    """Normalise a phone number into a stable contact_key.
+
+    Keeps only digits, drops a leading Indian country code (91) when the result
+    is a 12-digit 91XXXXXXXXXX, so the same person dialled as +91 98765 43210,
+    098765 43210, or 9876543210 all collapse to one key. Returns "" for empty /
+    junk input so callers can fall back to a name slug via `or`.
+
+    This is the canonical contact key going forward — phone is a far more stable
+    identity than the name-slug that contact_key_from_call_id derives, which
+    collides on same-name contacts and breaks history on a name edit.
+    """
+    if not phone:
+        return ""
+    digits = re.sub(r"\D+", "", phone)
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    elif len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits if len(digits) >= 7 else ""
 
 
 def slugify_contact(name: str) -> str:

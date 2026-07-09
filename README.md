@@ -57,6 +57,15 @@ cd frontend && npm install && npm run dev          # portal → http://localhost
 ```
 The only hard requirement is **PostgreSQL + a Sarvam API key** (https://dashboard.sarvam.ai). Tables auto-create on startup.
 
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+Tests run against an isolated in-memory SQLite DB (see `tests/conftest.py`) — never the
+configured `DATABASE_URL` — so they're safe to run against a dev database with real data.
+
 ## Project structure
 
 ```

@@ -43,6 +43,12 @@ class Organization(Base):
     languages = Column(JSON, nullable=True)          # [str, ...]
     usps = Column(JSON, nullable=True)               # [str, ...]
 
+    # Shown on the telecaller mobile app's Profile screen so a telecaller sees
+    # who they work for, not just their own name. Set from the founder web
+    # app's org settings page; nullable since no existing org has these yet.
+    logo_url = Column(String(500), nullable=True)
+    address = Column(Text, nullable=True)
+
     # Revenue goal tracking — drives the Monthly Goal gauge and the revenue
     # target line on the founder dashboard. Nullable: an org with no target set
     # simply gets no target-based breakdown (never a fabricated number).
@@ -71,6 +77,10 @@ class User(Base):
     name = Column(String(255), nullable=False)
     role = Column(String(30), nullable=False, default="founder")  # founder / ad_manager / telecaller
     is_active = Column(Boolean, nullable=False, default=True)
+    # True right after an invite/reset (temp password) until the user sets their
+    # own password via POST /api/auth/change-password. False for register (the
+    # founder already chose their own password at signup).
+    must_reset_password = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -95,6 +105,10 @@ class AudioCall(Base):
     transcript = Column(JSON, nullable=False)
     audio_file_url = Column(Text, nullable=False)
     processed_data = Column(JSON, nullable=True)
+    # SHA-256 of the uploaded audio bytes — lets /upload detect a retry/double-tap
+    # re-sending the exact same recording and return the existing call_id instead
+    # of creating a duplicate Lead/AudioCall/ProcessingJob.
+    content_hash = Column(String(64), nullable=True, index=True)
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -158,6 +172,9 @@ class LeadAnalysis(Base):
     bant_breakdown = Column(JSON, nullable=True)       # {budget, authority, need, timeline} each with score+reason
     lead_verdict = Column(String(20), nullable=True)   # Hot / Warm / Cold / Junk
     lead_verdict_reason = Column(Text, nullable=True)
+    # Why the analyzer set status="not_relevant" (relevance filter) — previously
+    # computed but discarded, so a not-relevant verdict was unexplainable later.
+    relevance_reason = Column(Text, nullable=True)
 
     # Per-turn data
     sentiment_arc = Column(JSON, nullable=True)        # [{turn, role, score, label}]
@@ -201,7 +218,10 @@ class Lead(Base):
     id = Column(String(255), primary_key=True, index=True)
     org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
     assigned_to = Column(String(255), ForeignKey("users.id"), nullable=True, index=True)
-    contact_key = Column(String(255), nullable=False, unique=True, index=True)
+    # NOT globally unique: contact_key is only unique WITHIN an org (see
+    # uq_leads_org_contact_key below). Two different orgs onboarding a lead with the
+    # same contact_key (e.g. same phone/email-derived slug) must not collide.
+    contact_key = Column(String(255), nullable=False, index=True)
     name = Column(String(255), nullable=True)
     phone = Column(String(40), nullable=True, index=True)
     reason = Column(Text, nullable=True)
@@ -218,9 +238,17 @@ class Lead(Base):
     # a lead that was reopened and hasn't re-closed.
     deal_value = Column(Integer, nullable=True)
     closed_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    # Discount/margin tracking (PRD Layer 4-C) — list_price is the pre-discount
+    # price; deal_value above is what actually closed. Margin = list_price -
+    # deal_value. Both nullable: most closed deals won't have these until the
+    # telecaller app starts collecting them at Closed Won.
+    discount_pct = Column(Float, nullable=True)
+    list_price = Column(Integer, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("org_id", "contact_key", name="uq_leads_org_contact_key"),)
 
     def __repr__(self):
         return f"<Lead(contact_key='{self.contact_key}', name='{self.name}', status='{self.status}')>"
@@ -238,7 +266,11 @@ class MemoryBubble(Base):
 
     id = Column(String(255), primary_key=True, index=True)
     org_id = Column(String(255), ForeignKey("organizations.id"), nullable=True, index=True)
-    contact_key = Column(String(255), nullable=False, unique=True, index=True)  # phone in prod
+    # NOT globally unique: contact_key is only unique WITHIN an org (see
+    # uq_memory_bubbles_org_contact_key below) — same reasoning as Lead.contact_key.
+    # Two different orgs whose contacts happen to derive the same contact_key
+    # (e.g. same phone/name slug) must not collide.
+    contact_key = Column(String(255), nullable=False, index=True)  # phone in prod
 
     total_calls = Column(Integer, default=0)
     last_call_id = Column(String(255), nullable=True)
@@ -255,6 +287,8 @@ class MemoryBubble(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("org_id", "contact_key", name="uq_memory_bubbles_org_contact_key"),)
 
     def __repr__(self):
         return f"<MemoryBubble(contact_key='{self.contact_key}', calls={self.total_calls})>"
@@ -282,7 +316,25 @@ class Attendance(Base):
         return f"<Attendance(user_id='{self.user_id}', date='{self.date}')>"
 
 
+class FollowUp(Base):
+    """A scheduled follow-up on a lead (call/WhatsApp/email), logged by the
+    telecaller app. Feeds the PRD's 'missed follow-up rate' leakage metric —
+    previously this data only ever lived in on-device SharedPreferences."""
 
+    __tablename__ = "follow_ups"
 
+    id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
+    lead_id = Column(String(255), ForeignKey("leads.id"), nullable=True, index=True)
+    telecaller_id = Column(String(255), ForeignKey("users.id"), nullable=False, index=True)
+    note = Column(Text, nullable=True)
+    due_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<FollowUp(id='{self.id}', due_at='{self.due_at}')>"
 
 

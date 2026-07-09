@@ -21,6 +21,7 @@ from app.models import AudioCall, Lead, LeadAnalysis, User
 from app.schemas_team import (
     InviteMemberRequest,
     InviteMemberResponse,
+    SetPasswordRequest,
     TeamMemberResponse,
     UpdateMemberRequest,
 )
@@ -136,6 +137,7 @@ async def invite_member(
         hashed_password=hash_password(temp_password),
         name=body.name,
         role=body.role,
+        must_reset_password=True,
     )
     db.add(user)
     db.commit()
@@ -170,3 +172,31 @@ async def update_member(
     db.refresh(user)
     metrics = _member_metrics_batch(db, [user.id])[user.id]
     return _to_member_response(user, metrics)
+
+
+@router.post("/{user_id}/reset-password", response_model=InviteMemberResponse)
+async def reset_member_password(
+    user_id: str,
+    body: SetPasswordRequest = SetPasswordRequest(),
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    """Sets a team member's password when their temp password is lost, needs
+    rotating, or the founder wants it to be something specific — same
+    generation/response shape as invite_member, since the founder shares this
+    new one manually the same way either way. body.new_password omitted/empty
+    -> a random temp password is generated (the original behaviour); provided
+    -> that exact value is used instead. Either way must_reset_password is set
+    so the member still confirms it by logging in with it once."""
+    user = db.query(User).filter(User.id == user_id, User.org_id == current_user.org_id).first()
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Team member not found")
+
+    new_password = body.new_password or _generate_temp_password()
+    user.hashed_password = hash_password(new_password)
+    user.must_reset_password = True
+    db.commit()
+    db.refresh(user)
+
+    metrics = _member_metrics_batch(db, [user.id])[user.id]
+    return InviteMemberResponse(member=_to_member_response(user, metrics), temp_password=new_password)

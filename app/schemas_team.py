@@ -37,3 +37,11 @@ class InviteMemberResponse(BaseModel):
 class UpdateMemberRequest(BaseModel):
     role: Optional[str] = None
     is_active: Optional[bool] = None
+
+
+class SetPasswordRequest(BaseModel):
+    """Empty/omitted new_password -> a random temp password is generated (the
+    original reset behaviour). Provided -> the founder's chosen value is used
+    instead, still one-time-displayed and still forces must_reset_password."""
+
+    new_password: Optional[str] = Field(None, min_length=8, max_length=128)

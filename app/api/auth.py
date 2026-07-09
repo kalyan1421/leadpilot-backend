@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Organization, User
 from app.schemas_auth import (
+    ChangePasswordRequest,
     LoginRequest,
     OrgProfileRequest,
     OrgProfileResponse,
@@ -55,6 +56,7 @@ def _to_user_response(user: User) -> UserResponse:
         email=user.email,
         name=user.name,
         role=user.role,
+        must_reset_password=user.must_reset_password,
     )
 
 
@@ -145,8 +147,16 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(func.lower(User.email) == body.email.lower()).first()
-    if user is None or not verify_password(body.password, user.hashed_password):
+    email = body.email.lower()
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+    if user is None:
+        # Client still gets the generic message (no account-enumeration), but the
+        # server log distinguishes "no such account" from "wrong password" so a
+        # failed login is debuggable without guessing.
+        logger.warning("login failed: no account for %s", email)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password")
+    if not verify_password(body.password, user.hashed_password):
+        logger.warning("login failed: bad password for %s (user %s)", email, user.id)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password")
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Account is disabled")
@@ -157,6 +167,25 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
+    return _to_user_response(current_user)
+
+
+@router.post("/change-password", response_model=UserResponse)
+async def change_password(
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Self-service password change — for a founder/admin changing their own
+    password by choice, and for a telecaller clearing must_reset_password after
+    an invite/reset (their temp password is exactly what current_password is)."""
+    if not verify_password(body.current_password, current_user.hashed_password):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+
+    current_user.hashed_password = hash_password(body.new_password)
+    current_user.must_reset_password = False
+    db.commit()
+    db.refresh(current_user)
     return _to_user_response(current_user)
 
 

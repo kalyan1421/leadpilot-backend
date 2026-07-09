@@ -23,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/attendance", tags=["attendance"])
 
+# All current orgs are India-based — attendance days are bucketed in IST so a
+# check-in just after local midnight isn't filed under the previous UTC day
+# (which would falsely block the day's real check-in with a 409, or make
+# `/today` return null right after checking in).
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _today_ist() -> date_type:
+    return datetime.now(IST).date()
+
 
 def _hours_worked(check_in_at: Optional[datetime], check_out_at: Optional[datetime]) -> Optional[float]:
     if check_in_at is None or check_out_at is None:
@@ -48,7 +58,7 @@ async def check_in(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    today = datetime.now(timezone.utc).date()
+    today = _today_ist()
     record = (
         db.query(Attendance)
         .filter(Attendance.user_id == current_user.id, Attendance.date == today)
@@ -81,7 +91,7 @@ async def check_out(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    today = datetime.now(timezone.utc).date()
+    today = _today_ist()
     record = (
         db.query(Attendance)
         .filter(Attendance.user_id == current_user.id, Attendance.date == today)
@@ -104,7 +114,7 @@ async def get_today(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    today = datetime.now(timezone.utc).date()
+    today = _today_ist()
     record = (
         db.query(Attendance)
         .filter(Attendance.user_id == current_user.id, Attendance.date == today)
@@ -124,7 +134,7 @@ async def list_attendance(
     db: Session = Depends(get_db),
 ):
     if to_date is None:
-        to_date = datetime.now(timezone.utc).date()
+        to_date = _today_ist()
     if from_date is None:
         from_date = to_date - timedelta(days=30)
 

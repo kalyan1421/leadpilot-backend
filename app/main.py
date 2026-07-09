@@ -11,6 +11,7 @@ from app.api.auth import router as auth_router
 from app.api.calls import router as calls_router
 from app.api.calls import intel_router
 from app.api.dashboard import router as dashboard_router
+from app.api.follow_ups import router as follow_ups_router
 from app.api.team import router as team_router
 from app.config import settings
 from app.database import engine
@@ -50,6 +51,7 @@ app.include_router(calls_router)
 app.include_router(intel_router)
 app.include_router(team_router)
 app.include_router(attendance_router)
+app.include_router(follow_ups_router)
 
 
 @app.on_event("startup")
@@ -100,8 +102,12 @@ async def health_check():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Global exception handler."""
-    logger.error(f"Unhandled exception: {exc}")
+    """Global exception handler. Log the method+path and full traceback so a 500
+    is diagnosable from the server log (the client still gets a generic message)."""
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}",
+        exc_info=True,
+    )
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.database import get_db
-from app.models import AudioCall, Lead, LeadAnalysis, Organization, User
+from app.models import Attendance, AudioCall, Lead, LeadAnalysis, Organization, User
 from app.utils.lead_intelligence import mmss_to_seconds
 from app.utils.memory_bubble import contact_key_from_call_id
 
@@ -27,7 +27,7 @@ KANBAN_STAGES = [
     "Negotiation", "Closed Won", "Closed Lost", "Junk",
 ]
 
-_DIMENSIONS = ["opening", "discovery", "pitch", "objection_handling", "closing"]
+_DIMENSIONS = ["opening", "discovery", "pitch", "objection_handling", "closing", "punctuality"]
 
 
 # ---------------------------------------------------------------------------
@@ -92,20 +92,13 @@ async def get_leads_board(
     return {"stages": KANBAN_STAGES, "leads": out}
 
 
-@router.patch("/leads/{lead_id}/stage", status_code=status.HTTP_200_OK)
-async def update_lead_stage(
-    lead_id: str,
-    body: Dict[str, Any],
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
+    """Shared by both the web Kanban (looked up by Lead.id) and the mobile
+    pipeline strip (looked up by contact_key, see update_lead_stage_by_contact)
+    so Closed Won/discount handling can't drift between the two callers."""
     stage = body.get("stage")
     if stage not in KANBAN_STAGES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"stage must be one of {KANBAN_STAGES}")
-
-    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
-    if lead is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
 
     lead.pipeline_stage = stage
 
@@ -118,11 +111,70 @@ async def update_lead_stage(
         deal_value = body.get("deal_value")
         if deal_value is not None:
             lead.deal_value = int(deal_value)
+        # Discount/margin tracking (PRD Layer 4-C) — only meaningful alongside
+        # a Closed Won deal_value, so both are only ever set on this branch.
+        list_price = body.get("list_price")
+        if list_price is not None:
+            lead.list_price = int(list_price)
+        discount_pct = body.get("discount_pct")
+        if discount_pct is not None:
+            lead.discount_pct = float(discount_pct)
     else:
         lead.closed_at = None
 
+    return lead
+
+
+@router.patch("/leads/{lead_id}/stage", status_code=status.HTTP_200_OK)
+async def update_lead_stage(
+    lead_id: str,
+    body: Dict[str, Any],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
+    if lead is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+
+    lead = _apply_stage_update(lead, body)
     db.commit()
-    return {"id": lead.id, "pipeline_stage": lead.pipeline_stage, "deal_value": lead.deal_value}
+    return {
+        "id": lead.id,
+        "pipeline_stage": lead.pipeline_stage,
+        "deal_value": lead.deal_value,
+        "list_price": lead.list_price,
+        "discount_pct": lead.discount_pct,
+    }
+
+
+@router.patch("/leads/by-contact/{contact_key}/stage", status_code=status.HTTP_200_OK)
+async def update_lead_stage_by_contact(
+    contact_key: str,
+    body: Dict[str, Any],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Mobile-app variant of update_lead_stage: the Flutter app only ever knows
+    a lead by contact_key (see AI_HANDOVER's contact_key convention), never the
+    Lead.id UUID the web Kanban uses — so it needs its own lookup rather than
+    forcing the client to learn a new identifier."""
+    lead = (
+        db.query(Lead)
+        .filter(Lead.contact_key == contact_key, Lead.org_id == current_user.org_id)
+        .first()
+    )
+    if lead is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+
+    lead = _apply_stage_update(lead, body)
+    db.commit()
+    return {
+        "contact_key": lead.contact_key,
+        "pipeline_stage": lead.pipeline_stage,
+        "deal_value": lead.deal_value,
+        "list_price": lead.list_price,
+        "discount_pct": lead.discount_pct,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +200,7 @@ def _compute_telecaller_metrics(
 
     closed_won = [leadrow for leadrow in assigned_leads if leadrow.pipeline_stage == "Closed Won"]
     close_pct = round(100 * len(closed_won) / len(assigned_leads), 1) if assigned_leads else 0.0
+    revenue = sum(leadrow.deal_value or 0 for leadrow in closed_won)
 
     debriefs = [analyses[c.call_id].agent_debrief for c in calls
                 if c.call_id in analyses and isinstance(analyses[c.call_id].agent_debrief, dict)]
@@ -155,7 +208,9 @@ def _compute_telecaller_metrics(
     for dim in _DIMENSIONS:
         vals = [d[f"{dim}_score"] for d in debriefs if isinstance(d.get(f"{dim}_score"), (int, float))]
         dims[dim] = round(sum(vals) / len(vals)) if vals else 0
-    quality = round(sum(dims.values())) if debriefs else 0  # 5 dims * 20pts = /100, matches score_dimensions.json
+    # 5 dims * 20pts + punctuality * 10pts = /110 (punctuality is additive, see
+    # lead_analyzer.py — doesn't change what the original 5 dims/scale mean).
+    quality = round(sum(dims.values())) if debriefs else 0
 
     talk_times = []
     for c in connected:
@@ -189,9 +244,12 @@ def _compute_telecaller_metrics(
 
     return {
         "calls": total_calls,
+        "connected": len(connected),
         "connect_pct": connect_pct,
         "positive_pct": positive_pct,
+        "closed_won": len(closed_won),
         "close_pct": close_pct,
+        "revenue": revenue,
         "talk_time_seconds": talk_time_seconds,
         "quality": quality,
         "trend": trend,
@@ -292,6 +350,225 @@ async def get_telecaller_performance(
     }
 
     return {"telecallers": results, "team_average": team_average}
+
+
+# ---------------------------------------------------------------------------
+# Team health board (Active/Break/Inactive/Absent) — PRD Layer 1-B
+# ---------------------------------------------------------------------------
+
+# PRD's own status thresholds (Section 1-B "Status Definitions"):
+# Active = on a call or logged in and making calls
+# Break = logged in, no call in the last 15 min
+# Inactive = no call in the last 45 min, or logged out
+# Absent = not logged in during working hours
+_BREAK_THRESHOLD_MIN = 15
+_INACTIVE_THRESHOLD_MIN = 45
+
+
+def _telecaller_status(
+    now: datetime, attendance: Optional[Attendance], last_call_at: Optional[datetime]
+) -> str:
+    """Heuristic status derived from existing Attendance + AudioCall timestamps.
+    There's no live presence/break-toggle system in this codebase, so this
+    approximates the PRD's board rather than building real-time presence
+    tracking — a telecaller who's actually on a break but has no stale-call
+    signal yet (just checked in, hasn't called) would still read as Active."""
+    if attendance is None or attendance.check_in_at is None:
+        return "Absent"
+    if attendance.check_out_at is not None:
+        return "Inactive"
+
+    reference = last_call_at or attendance.check_in_at
+    minutes_since = (now - reference).total_seconds() / 60
+    if minutes_since <= _BREAK_THRESHOLD_MIN:
+        return "Active"
+    if minutes_since <= _INACTIVE_THRESHOLD_MIN:
+        return "Break"
+    return "Inactive"
+
+
+@router.get("/telecallers/status", status_code=status.HTTP_200_OK)
+async def get_team_status(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Team Health board — one row per telecaller with a derived
+    Active/Break/Inactive/Absent status plus today's calls/connected/
+    closed/quality/revenue, reusing the same batch metrics as
+    /telecallers/performance instead of re-querying."""
+    telecallers = (
+        db.query(User)
+        .filter(User.org_id == current_user.org_id, User.role == "telecaller")
+        .all()
+    )
+    telecaller_ids = [tc.id for tc in telecallers]
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    start_of_today = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+
+    metrics_by_tc = _telecaller_metrics_batch(db, telecaller_ids, current_user.org_id)
+
+    attendance_by_tc: Dict[str, Attendance] = {
+        a.user_id: a
+        for a in db.query(Attendance)
+        .filter(
+            Attendance.org_id == current_user.org_id,
+            Attendance.user_id.in_(telecaller_ids),
+            Attendance.date == today,
+        )
+        .all()
+    }
+
+    last_call_by_tc: Dict[str, datetime] = {}
+    for call in (
+        db.query(AudioCall)
+        .filter(
+            AudioCall.org_id == current_user.org_id,
+            AudioCall.telecaller_id.in_(telecaller_ids),
+            AudioCall.timestamp >= start_of_today,
+        )
+        .order_by(AudioCall.timestamp.asc())
+        .all()
+    ):
+        last_call_by_tc[call.telecaller_id] = call.timestamp  # later rows overwrite -> latest wins
+
+    revenue_today_by_tc: Dict[str, int] = {tid: 0 for tid in telecaller_ids}
+    for lead in (
+        db.query(Lead)
+        .filter(
+            Lead.org_id == current_user.org_id,
+            Lead.assigned_to.in_(telecaller_ids),
+            Lead.pipeline_stage == "Closed Won",
+            Lead.closed_at >= start_of_today,
+        )
+        .all()
+    ):
+        revenue_today_by_tc[lead.assigned_to] = (
+            revenue_today_by_tc.get(lead.assigned_to, 0) + (lead.deal_value or 0)
+        )
+
+    results = [
+        {
+            "id": tc.id,
+            "name": tc.name,
+            "status": _telecaller_status(now, attendance_by_tc.get(tc.id), last_call_by_tc.get(tc.id)),
+            "calls": metrics_by_tc.get(tc.id, {}).get("calls", 0),
+            "connected": metrics_by_tc.get(tc.id, {}).get("connected", 0),
+            "closed_won": metrics_by_tc.get(tc.id, {}).get("closed_won", 0),
+            "quality": metrics_by_tc.get(tc.id, {}).get("quality", 0),
+            "trend": metrics_by_tc.get(tc.id, {}).get("trend"),
+            "revenue_today": revenue_today_by_tc.get(tc.id, 0),
+        }
+        for tc in telecallers
+    ]
+
+    return {"telecallers": results}
+
+
+# ---------------------------------------------------------------------------
+# Coaching & Development recommendation queue (read-only) — PRD Layer 2-D
+# ---------------------------------------------------------------------------
+
+# /20 for the 5 original dimensions, /10 for punctuality (see lead_analyzer.py).
+_COACHING_THRESHOLDS = {
+    "opening": 12, "discovery": 12, "pitch": 12,
+    "objection_handling": 12, "closing": 12, "punctuality": 5,
+}
+_COACHING_LABELS = {
+    "opening": "Opening", "discovery": "Discovery", "pitch": "Pitch",
+    "objection_handling": "Objection Handling", "closing": "Closing", "punctuality": "Punctuality",
+}
+_COACHING_ACTIONS = {
+    "opening": "Review opening scripts and greeting technique",
+    "discovery": "Coach on asking better discovery/qualifying questions",
+    "pitch": "Practice pitch delivery and value-proposition framing",
+    "objection_handling": "Role-play the team's most common objections",
+    "closing": "Review closing techniques and call-to-action phrasing",
+    "punctuality": "Work on call pacing — avoid dead air and rambling",
+}
+_COACHING_WINDOW_DAYS = 14
+_COACHING_MIN_CALLS = 3  # below this, a low average isn't a confident signal
+
+
+@router.get("/coaching/queue", status_code=status.HTTP_200_OK)
+async def get_coaching_queue(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Read-only recommendation queue: flags telecallers whose trailing-14-day
+    average on any scoring dimension falls below a threshold. Derived entirely
+    from existing call/analysis data — no new table, no session-logging or
+    before/after tracking (explicitly out of scope for this pass, see plan).
+    """
+    telecallers = (
+        db.query(User)
+        .filter(User.org_id == current_user.org_id, User.role == "telecaller")
+        .all()
+    )
+    telecaller_ids = [tc.id for tc in telecallers]
+    window_start = datetime.now(timezone.utc) - timedelta(days=_COACHING_WINDOW_DAYS)
+
+    calls_by_tc: Dict[str, List[AudioCall]] = {tid: [] for tid in telecaller_ids}
+    for call in (
+        db.query(AudioCall)
+        .filter(
+            AudioCall.telecaller_id.in_(telecaller_ids),
+            AudioCall.org_id == current_user.org_id,
+            AudioCall.timestamp >= window_start,
+        )
+        .all()
+    ):
+        calls_by_tc[call.telecaller_id].append(call)
+
+    analyses_by_call_id = {
+        a.call_id: a
+        for a in db.query(LeadAnalysis)
+        .join(AudioCall, AudioCall.call_id == LeadAnalysis.call_id)
+        .filter(
+            AudioCall.telecaller_id.in_(telecaller_ids),
+            AudioCall.org_id == current_user.org_id,
+            AudioCall.timestamp >= window_start,
+            LeadAnalysis.status == "completed",
+        )
+        .all()
+    }
+
+    queue: List[Dict[str, Any]] = []
+    for tc in telecallers:
+        debriefs = [
+            analyses_by_call_id[c.call_id].agent_debrief
+            for c in calls_by_tc.get(tc.id, [])
+            if c.call_id in analyses_by_call_id and isinstance(analyses_by_call_id[c.call_id].agent_debrief, dict)
+        ]
+        if len(debriefs) < _COACHING_MIN_CALLS:
+            continue
+
+        for dim, threshold in _COACHING_THRESHOLDS.items():
+            vals = [d.get(f"{dim}_score") for d in debriefs if isinstance(d.get(f"{dim}_score"), (int, float))]
+            if not vals:
+                continue
+            avg = sum(vals) / len(vals)
+            if avg >= threshold:
+                continue
+            gap_ratio = (threshold - avg) / threshold
+            priority = "High" if gap_ratio >= 0.5 else "Medium" if gap_ratio >= 0.25 else "Low"
+            max_score = 10 if dim == "punctuality" else 20
+            queue.append({
+                "telecaller_id": tc.id,
+                "telecaller_name": tc.name,
+                "issue": (
+                    f"{_COACHING_LABELS[dim]} averaging {round(avg, 1)}/{max_score} "
+                    f"over the last {_COACHING_WINDOW_DAYS} days ({len(debriefs)} calls)"
+                ),
+                "recommended_action": _COACHING_ACTIONS[dim],
+                "priority": priority,
+            })
+
+    priority_rank = {"High": 0, "Medium": 1, "Low": 2}
+    queue.sort(key=lambda r: priority_rank[r["priority"]])
+    return {"queue": queue}
 
 
 # ---------------------------------------------------------------------------
@@ -654,9 +931,34 @@ def _lead_quality(db: Session, org_id: str) -> Dict[str, Any]:
 
     leads = db.query(Lead).filter(Lead.org_id == org_id).all()
     source_breakdown: Dict[str, int] = {}
+    # Cross-tab source × verdict/close — previously source_breakdown and
+    # verdict_breakdown were computed independently, so "junk% per source"
+    # couldn't be derived from the response at all.
+    by_source: Dict[str, Dict[str, int]] = {}
     for lead in leads:
         source = lead.source or "Unknown"
         source_breakdown[source] = source_breakdown.get(source, 0) + 1
+        row = by_source.setdefault(source, {"total": 0, "junk": 0, "positive": 0, "closed_won": 0})
+        row["total"] += 1
+        verdict = verdicts_by_contact.get(lead.contact_key)
+        if verdict == "Junk":
+            row["junk"] += 1
+        if verdict in ("Hot", "Warm"):
+            row["positive"] += 1
+        if lead.pipeline_stage == "Closed Won":
+            row["closed_won"] += 1
+
+    source_matrix = [
+        {
+            "source": source,
+            "total": row["total"],
+            "junk_pct": round(100 * row["junk"] / row["total"], 1) if row["total"] else 0.0,
+            "positive_pct": round(100 * row["positive"] / row["total"], 1) if row["total"] else 0.0,
+            "close_pct": round(100 * row["closed_won"] / row["total"], 1) if row["total"] else 0.0,
+        }
+        for source, row in by_source.items()
+    ]
+    source_matrix.sort(key=lambda r: r["total"], reverse=True)
 
     scores_by_contact = _latest_scores_by_contact(db, org_id)
     avg_bant_score = (
@@ -667,6 +969,7 @@ def _lead_quality(db: Session, org_id: str) -> Dict[str, Any]:
     return {
         "verdict_breakdown": verdict_breakdown,
         "source_breakdown": source_breakdown,
+        "source_matrix": source_matrix,
         "avg_bant_score": avg_bant_score,
     }
 
@@ -677,6 +980,70 @@ async def get_leads_quality(
     db: Session = Depends(get_db),
 ):
     return _lead_quality(db, current_user.org_id)
+
+
+_SCORE_BANDS = [(81, 100, "81-100"), (61, 80, "61-80"), (41, 60, "41-60"), (21, 40, "21-40"), (0, 20, "0-20")]
+
+
+@router.get("/leads/score-distribution", status_code=status.HTTP_200_OK)
+async def get_score_distribution(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Buckets each contact's latest BANT score into the PRD's 5 bands, with
+    close-rate per band (PRD Layer 3-B.2)."""
+    scores_by_contact = _latest_scores_by_contact(db, current_user.org_id)
+    leads = db.query(Lead).filter(Lead.org_id == current_user.org_id).all()
+    stage_by_contact = {lead.contact_key: lead.pipeline_stage for lead in leads}
+
+    bands = []
+    total = len(scores_by_contact)
+    for lo, hi, label in _SCORE_BANDS:
+        contacts = [ck for ck, score in scores_by_contact.items() if lo <= score <= hi]
+        count = len(contacts)
+        closed = sum(1 for ck in contacts if stage_by_contact.get(ck) == "Closed Won")
+        bands.append({
+            "label": label,
+            "count": count,
+            "pct_of_total": round(100 * count / total, 1) if total else 0.0,
+            "close_rate_pct": round(100 * closed / count, 1) if count else 0.0,
+        })
+    return {"bands": bands}
+
+
+@router.get("/leads/ageing", status_code=status.HTTP_200_OK)
+async def get_leads_ageing(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Buckets open (non-terminal) leads by days-since-last-update (PRD Layer
+    3-A.2) — reuses the same days_stuck computation as /leads/board."""
+    leads = (
+        db.query(Lead)
+        .filter(
+            Lead.org_id == current_user.org_id,
+            Lead.pipeline_stage.notin_(["Closed Won", "Closed Lost", "Junk"]),
+        )
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    summary = {"0-3": 0, "3-7": 0, "7+": 0}
+    rows = []
+    for lead in leads:
+        updated = lead.updated_at or lead.created_at
+        days = max(0, (now - updated).days) if updated else 0
+        bucket = "0-3" if days <= 3 else "3-7" if days <= 7 else "7+"
+        summary[bucket] += 1
+        rows.append({
+            "id": lead.id,
+            "name": lead.name or lead.contact_key,
+            "source": lead.source,
+            "pipeline_stage": lead.pipeline_stage,
+            "days_stuck": days,
+            "bucket": bucket,
+        })
+    rows.sort(key=lambda r: r["days_stuck"], reverse=True)
+    return {"summary": summary, "leads": rows}
 
 
 # ---------------------------------------------------------------------------

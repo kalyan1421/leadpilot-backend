@@ -70,6 +70,13 @@ _SCORING_SCHEMA: Dict[str, Any] = {
         "pitch_score": {"type": "integer"}, "pitch_note": {"type": "string"},
         "objection_handling_score": {"type": "integer"}, "objection_handling_note": {"type": "string"},
         "closing_score": {"type": "integer"}, "closing_note": {"type": "string"},
+        # Punctuality (0-10) — judged from the transcript's OWN turn timestamps
+        # (pacing: no rambling/dead air, timely progression), not any external
+        # scheduling data (the system has no reliable call-was-scheduled-for-X
+        # signal to compare against). Additive to the 5 dimensions above, not a
+        # replacement — those keep their existing 0-20 scale unchanged.
+        "punctuality_score": {"type": "integer"}, "punctuality_note": {"type": "string"},
+        "punctuality_evidence_turns": {"type": "array", "items": {"type": "integer"}},
         # Evidence: the transcript Turn numbers that justify each dimension's score.
         # Resolved to exact quote+timestamp+speaker downstream (auditable, not paraphrased).
         "opening_evidence_turns": {"type": "array", "items": {"type": "integer"}},
@@ -77,6 +84,20 @@ _SCORING_SCHEMA: Dict[str, Any] = {
         "pitch_evidence_turns": {"type": "array", "items": {"type": "integer"}},
         "objection_handling_evidence_turns": {"type": "array", "items": {"type": "integer"}},
         "closing_evidence_turns": {"type": "array", "items": {"type": "integer"}},
+        # Script compliance checklist — order/timing judgment for the SAME 5
+        # dimensions above, reused as "steps" rather than a separate per-org
+        # custom script definition (none exists in this system).
+        "script_compliance": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "step": {"type": "string", "enum": [
+                    "opening", "discovery", "pitch", "objection_handling", "closing",
+                ]},
+                "status": {"type": "string", "enum": ["followed", "too_early", "too_late", "skipped"]},
+                "note": {"type": "string"},
+            },
+            "required": ["step", "status"],
+        }},
         "strengths": {"type": "array", "items": {"type": "string"}},
         "improvements": {"type": "array", "items": {"type": "string"}},
         # Summary + actions
@@ -103,11 +124,17 @@ _SCORING_SCHEMA: Dict[str, Any] = {
         "entity_need": {"type": "string"}, "entity_timeline": {"type": "string"},
         "entity_location": {"type": "string"}, "entity_product_interest": {"type": "string"},
         "objections": {"type": "array", "items": {"type": "string"}},
+        # Relevance filter — only meaningful when ORGANISATION CONTEXT was supplied.
+        # Lets a call about a wrong number / unrelated topic be flagged instead of
+        # scored as if it were a normal (bad) sales conversation.
+        "is_relevant": {"type": "boolean"},
+        "relevance_reason": {"type": "string"},
     },
     "required": [
         "lead_verdict", "budget_score", "authority_score", "need_score", "timeline_score",
         "opening_score", "discovery_score", "pitch_score", "objection_handling_score",
-        "closing_score", "key_points", "next_steps", "overall_tone",
+        "closing_score", "punctuality_score", "script_compliance",
+        "key_points", "next_steps", "overall_tone", "is_relevant",
     ],
 }
 
@@ -161,7 +188,26 @@ _SCORING_SYS = (
     "CRITICAL: for each of the 5 telecaller dimensions, return *_evidence_turns = the 1-2 Turn "
     "NUMBERS from the transcript that most justify that score. Use DISTINCT, specific turns where "
     "that behaviour actually happens (e.g. the closing turns for closing, the pitch turns for pitch) "
-    "— do NOT default to Turn 1 for every dimension. Cite the actual turns you judged from."
+    "— do NOT default to Turn 1 for every dimension. Cite the actual turns you judged from. "
+    "PUNCTUALITY (0-10): judge PACING from the transcript's own turn timestamps only — good "
+    "punctuality means no unnecessary long silences/rambling and timely progression through the "
+    "call's stages; this is NOT about whether the call happened at some externally scheduled time "
+    "(you have no visibility into that). "
+    "SCRIPT COMPLIANCE: for each of the 5 telecaller dimensions (as 'step'), judge whether the "
+    "telecaller followed it at the right point in the call: 'followed' (done, right timing), "
+    "'too_early' (done, but prematurely — e.g. pricing before discovery), 'too_late' (done, but "
+    "delayed), or 'skipped' (never done). One entry per step, every call. "
+    "RELEVANCE FILTER: if an ORGANISATION CONTEXT block is present, first judge whether this call "
+    "is actually about that business's stated services. If it clearly is not (wrong number, "
+    "unrelated topic, spam), set is_relevant=false and explain why in relevance_reason — this is "
+    "a LABEL only. Still score EVERY dimension normally on its own merits from what actually "
+    "happened in the call (telecaller performance, BANT/lead quality, sentiment, punctuality, and "
+    "every script_compliance entry), exactly as you would for a relevant call. Do NOT force scores "
+    "to 0 or the verdict to Junk just because the call is off-topic — judge honestly: a genuine "
+    "wrong number will naturally score low on lead quality, but let the transcript decide rather "
+    "than blanking it. If it IS relevant, set is_relevant=true and let the organisation's "
+    "services/audience/brand voice sharpen your judgement of fit and next steps. If no "
+    "ORGANISATION CONTEXT is present, always set is_relevant=true and score normally."
 )
 _SENTIMENT_SYS = (
     "You are a sentiment analyst. For EACH turn shown, output one arc entry: the same turn number, "
@@ -183,15 +229,16 @@ class LeadAnalyzer:
 
     # -- public ------------------------------------------------------------
 
-    def analyze(self, transcript: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def analyze(self, transcript: Dict[str, Any], org_context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         turns = self._turns(transcript)
         if not turns:
             return self._empty_result()
         try:
             chunks = _chunk(turns, _CHUNK_TURNS, _CHUNK_OVERLAP)
-            if len(chunks) == 1:
-                scoring = self._call(self._score_messages(self._numbered(turns)), _SCORING_SCHEMA, "record_analysis")
-            else:
+
+            def _score() -> Dict[str, Any]:
+                if len(chunks) == 1:
+                    return self._call(self._score_messages(self._numbered(turns), org_context), _SCORING_SCHEMA, "record_analysis")
                 logger.info(f"Lead analysis: long call → map-reduce over {len(chunks)} chunks")
                 def _digest(c):
                     try:
@@ -202,9 +249,19 @@ class LeadAnalyzer:
                         return {}
                 with ThreadPoolExecutor(max_workers=_MAP_WORKERS) as ex:
                     digests = list(ex.map(_digest, chunks))
-                scoring = self._call(self._reduce_messages(digests), _SCORING_SCHEMA, "record_analysis")
+                return self._call(self._reduce_messages(digests, org_context), _SCORING_SCHEMA, "record_analysis")
 
-            arc, intent = self._sentiment(chunks)
+            # Sentiment is computed straight from `chunks` — it doesn't depend on
+            # scoring/digests at all, so run it concurrently with _score() instead
+            # of after it. Was previously sequential (scoring fully done, *then*
+            # sentiment started), wasting the entire sentiment phase's wall-clock
+            # time on every call.
+            with ThreadPoolExecutor(max_workers=2) as top_ex:
+                score_future = top_ex.submit(_score)
+                sentiment_future = top_ex.submit(self._sentiment, chunks)
+                scoring = score_future.result()
+                arc, intent = sentiment_future.result()
+
             result = self._assemble(scoring, arc, intent, turns)
             logger.info(f"Lead analysis ok: verdict={result['lead_verdict']} bant={result['bant_score']} "
                         f"agent={result['agent_debrief']['total_score']} arc={len(arc)}")
@@ -262,15 +319,44 @@ class LeadAnalyzer:
 
     # -- message builders --------------------------------------------------
 
-    def _score_messages(self, text: str) -> List[Dict[str, str]]:
-        return [{"role": "system", "content": _SCORING_SYS},
+    @staticmethod
+    def _org_context_block(org_context: Optional[Dict[str, Any]]) -> str:
+        """Renders the Organisation Knowledge Base as prompt context so scoring,
+        relevance-filtering, and next-action suggestions are grounded in what this
+        specific business actually sells — not generic sales-call heuristics."""
+        if not org_context:
+            return ""
+        services = ", ".join(org_context.get("services") or []) or "not specified"
+        usps = ", ".join(org_context.get("usps") or []) or "not specified"
+        competitors = ", ".join(org_context.get("competitors") or []) or "not specified"
+        languages = ", ".join(org_context.get("languages") or []) or "not specified"
+        pricing_min, pricing_max = org_context.get("pricing_min"), org_context.get("pricing_max")
+        if pricing_min is not None or pricing_max is not None:
+            pricing = f"{pricing_min or '?'} - {pricing_max or '?'}"
+        else:
+            pricing = "not specified"
+        return (
+            "\n\nORGANISATION CONTEXT:\n"
+            f"Business: {org_context.get('name') or 'unknown'} ({org_context.get('industry') or 'unspecified industry'})\n"
+            f"Website: {org_context.get('website_url') or 'not specified'}\n"
+            f"Services offered: {services}\n"
+            f"Pricing range: {pricing}\n"
+            f"Target audience: {org_context.get('target_audience') or 'not specified'}\n"
+            f"Brand voice: {org_context.get('brand_voice') or 'not specified'}\n"
+            f"Competitors: {competitors}\n"
+            f"Languages spoken: {languages}\n"
+            f"USPs: {usps}\n"
+        )
+
+    def _score_messages(self, text: str, org_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+        return [{"role": "system", "content": _SCORING_SYS + self._org_context_block(org_context)},
                 {"role": "user", "content": f"TRANSCRIPT:\n{text}"}]
 
     def _digest_messages(self, text: str) -> List[Dict[str, str]]:
         return [{"role": "system", "content": _DIGEST_SYS},
                 {"role": "user", "content": f"CALL SEGMENT:\n{text}"}]
 
-    def _reduce_messages(self, digests: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    def _reduce_messages(self, digests: List[Dict[str, Any]], org_context: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
         digests = [d if isinstance(d, dict) else {} for d in digests]  # tolerate bad map output
         block = "\n\n".join(
             f"--- SEGMENT {i + 1} ---\nsummary: {d.get('summary')}\n"
@@ -281,7 +367,7 @@ class LeadAnalyzer:
             f"timeline={d.get('timeline')} location={d.get('location')} product={d.get('product_interest')}"
             for i, d in enumerate(digests)
         )
-        return [{"role": "system", "content": _SCORING_SYS},
+        return [{"role": "system", "content": _SCORING_SYS + self._org_context_block(org_context)},
                 {"role": "user", "content": "The call was long; here are ordered segment digests. "
                                             f"Score the WHOLE call from them:\n\n{block}"}]
 
@@ -320,7 +406,15 @@ class LeadAnalyzer:
             "objection_handling_evidence": self._evidence(s.get("objection_handling_evidence_turns"), turns),
             "closing_score": clamp(s.get("closing_score"), 0, 20), "closing_note": s.get("closing_note") or "",
             "closing_evidence": self._evidence(s.get("closing_evidence_turns"), turns),
+            "punctuality_score": clamp(s.get("punctuality_score"), 0, 10),
+            "punctuality_note": s.get("punctuality_note") or "",
+            "punctuality_evidence": self._evidence(s.get("punctuality_evidence_turns"), turns),
+            "script_compliance": self._script_compliance(s.get("script_compliance")),
         }
+        # total_score is unchanged (still the original 5 dims, /100) — punctuality is
+        # additive and surfaced separately (get_call_score's breakdown, dashboard.py's
+        # quality aggregate) rather than folded into what "Overall"/total_score already
+        # means everywhere it's displayed today.
         debrief["total_score"] = (debrief["opening_score"] + debrief["discovery_score"] + debrief["pitch_score"]
                                   + debrief["objection_handling_score"] + debrief["closing_score"])
 
@@ -362,6 +456,8 @@ class LeadAnalyzer:
                 "urgency": s.get("urgency") or ("immediate" if verdict == "Hot" else "within_week"),
             },
             "agent_debrief": debrief,
+            "is_relevant": bool(s.get("is_relevant", True)),
+            "relevance_reason": s.get("relevance_reason") or "",
         }
 
     @staticmethod
@@ -390,6 +486,27 @@ class LeadAnalyzer:
                     break
         return out
 
+    _SCRIPT_STEPS = ("opening", "discovery", "pitch", "objection_handling", "closing")
+    _SCRIPT_STATUSES = ("followed", "too_early", "too_late", "skipped")
+
+    @classmethod
+    def _script_compliance(cls, raw: Any) -> List[Dict[str, str]]:
+        """Validates/dedupes the model's script_compliance array — one entry per
+        known step, unknown steps/statuses dropped rather than trusted verbatim."""
+        by_step: Dict[str, Dict[str, str]] = {}
+        for entry in (raw or []):
+            if not isinstance(entry, dict):
+                continue
+            step = entry.get("step")
+            status = entry.get("status")
+            if step not in cls._SCRIPT_STEPS or status not in cls._SCRIPT_STATUSES:
+                continue
+            by_step[step] = {"step": step, "status": status, "note": entry.get("note") or ""}
+        # Any step the model didn't return an entry for defaults to "skipped" —
+        # better than silently omitting it from the checklist.
+        return [by_step.get(step, {"step": step, "status": "skipped", "note": ""})
+                for step in cls._SCRIPT_STEPS]
+
     # -- transcript helpers ------------------------------------------------
 
     @staticmethod
@@ -406,22 +523,41 @@ class LeadAnalyzer:
             for i, t in enumerate(turns)
         )
 
-    @staticmethod
-    def _empty_result() -> Dict[str, Any]:
+    @classmethod
+    def _empty_debrief(cls, reason: str = "") -> Dict[str, Any]:
+        """A fully-shaped debrief with every field the success path emits, all
+        zeroed. Used for the no-transcript path AND the analysis-failure path
+        (see empty_analysis) so the Score tab always has all 6 dimensions +
+        script_compliance to render — greyed at 0 — instead of a blank tab or
+        missing keys."""
+        debrief: Dict[str, Any] = {"strengths": [], "improvements": []}
+        for dim in ("opening", "discovery", "pitch", "objection_handling", "closing"):
+            debrief[f"{dim}_score"] = 0
+            debrief[f"{dim}_note"] = reason
+            debrief[f"{dim}_evidence"] = []
+        debrief["punctuality_score"] = 0
+        debrief["punctuality_note"] = reason
+        debrief["punctuality_evidence"] = []
+        debrief["script_compliance"] = [
+            {"step": step, "status": "skipped", "note": ""} for step in cls._SCRIPT_STEPS
+        ]
+        debrief["total_score"] = 0
+        return debrief
+
+    @classmethod
+    def _empty_result(cls, reason: str = "No transcript available") -> Dict[str, Any]:
         return {
             "sentiment_arc": [], "intent_tags": [],
             "entities": {"budget": None, "authority": None, "need": None, "timeline": None,
                          "location": None, "product_interest": None, "objections": []},
             "bant_breakdown": {k: {"score": 0, "reason": "no transcript"} for k in ("budget", "authority", "need", "timeline")},
-            "bant_score": 0, "lead_verdict": "Junk", "lead_verdict_reason": "No transcript available",
+            "bant_score": 0, "lead_verdict": "Junk", "lead_verdict_reason": reason,
             "call_summary": {"headline": "No transcript", "key_moments": [], "objections_raised": [],
                              "commitments_made": [], "overall_tone": "neutral"},
             "key_points": [], "next_steps": [],
             "next_action": {"recommended_action": "disqualify", "follow_up_script": "", "channel": "none", "urgency": "low_priority"},
-            "agent_debrief": {"strengths": [], "improvements": [],
-                              "opening_score": 0, "opening_note": "", "discovery_score": 0, "discovery_note": "",
-                              "pitch_score": 0, "pitch_note": "", "objection_handling_score": 0, "objection_handling_note": "",
-                              "closing_score": 0, "closing_note": "", "total_score": 0},
+            "agent_debrief": cls._empty_debrief(reason),
+            "is_relevant": True, "relevance_reason": "",
         }
 
 
@@ -447,5 +583,13 @@ def get_analyzer() -> LeadAnalyzer:
     return _analyzer
 
 
-def analyze_call(transcript: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    return get_analyzer().analyze(transcript)
+def analyze_call(transcript: Dict[str, Any], org_context: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    return get_analyzer().analyze(transcript, org_context=org_context)
+
+
+def empty_analysis(reason: str = "Analysis unavailable") -> Dict[str, Any]:
+    """Fully-shaped, all-zero analysis result. The upload pipeline persists this
+    (with LeadAnalysis.status='failed') when the analyzer can't produce a real
+    result, so the Score tab still renders all 6 dimensions greyed at 0 with an
+    error banner instead of 404-ing or showing a blank screen."""
+    return LeadAnalyzer._empty_result(reason)

@@ -26,6 +26,7 @@ class UserResponse(BaseModel):
     email: str
     name: str
     role: str
+    must_reset_password: bool
 
     class Config:
         from_attributes = True
@@ -37,22 +38,33 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 class OrgProfileRequest(BaseModel):
     """All fields optional — the onboarding wizard sends everything at once on
     launch, the settings page sends only what changed on an edit."""
 
+    # max_length on the string fields mirrors the Organization column widths so
+    # overlong input is rejected with a clean 422 instead of hitting a Postgres
+    # "value too long" DataError → opaque 500. target_audience/address are TEXT
+    # (unbounded) and the list fields are JSON (no width limit), so no cap there.
     name: Optional[str] = Field(None, min_length=2, max_length=255)
-    industry: Optional[str] = None
-    website_url: Optional[str] = None
+    industry: Optional[str] = Field(None, max_length=100)
+    website_url: Optional[str] = Field(None, max_length=500)
     services: Optional[List[str]] = None
     pricing_min: Optional[int] = None
     pricing_max: Optional[int] = None
     target_audience: Optional[str] = None
     competitors: Optional[List[str]] = None
-    brand_voice: Optional[str] = None
+    brand_voice: Optional[str] = Field(None, max_length=50)
     languages: Optional[List[str]] = None
     usps: Optional[List[str]] = None
     monthly_revenue_target: Optional[int] = None
+    logo_url: Optional[str] = Field(None, max_length=500)
+    address: Optional[str] = None
 
 
 class OrgProfileResponse(BaseModel):
@@ -70,6 +82,8 @@ class OrgProfileResponse(BaseModel):
     languages: Optional[List[str]] = None
     usps: Optional[List[str]] = None
     monthly_revenue_target: Optional[int] = None
+    logo_url: Optional[str] = None
+    address: Optional[str] = None
 
     class Config:
         from_attributes = True

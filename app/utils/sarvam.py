@@ -19,6 +19,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import settings
@@ -27,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _key_idx = 0  # which key we're currently using (module-global, rotates forward)
+
+# Brief pause before rotating on a 429 specifically — without it, a burst of rate-limit
+# errors across all keys burns through the whole rotation in milliseconds with zero
+# cooldown. Not applied to 403 (insufficient credits) — no amount of waiting fixes an
+# exhausted quota, so that case should still rotate immediately.
+_RATE_LIMIT_BACKOFF_SECONDS = 0.75
 
 
 def _keys() -> List[str]:
@@ -57,6 +64,19 @@ def _is_quota_error(e: Exception) -> bool:
     ))
 
 
+def _is_rate_limit_error(e: Exception) -> bool:
+    """429 specifically, as distinct from 403 (insufficient credits) — used to decide
+    whether a brief backoff is worth it before rotating (see _RATE_LIMIT_BACKOFF_SECONDS)."""
+    if getattr(e, "status_code", None) == 429:
+        return True
+    body = getattr(e, "body", None)
+    msg = ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        msg = str(err.get("message", "") if isinstance(err, dict) else err).lower()
+    return any(x in msg for x in ("rate limit", "too many requests"))
+
+
 def _run_with_rotation(call: Callable[[Any], Any]) -> Any:
     """Run `call(client)`, rotating through all keys on quota/rate errors."""
     global _key_idx
@@ -75,6 +95,8 @@ def _run_with_rotation(call: Callable[[Any], Any]) -> Any:
             if _is_quota_error(e):
                 logger.warning(f"Sarvam key #{idx + 1}/{len(keys)} exhausted/limited "
                                f"({str(e)[:100]}); rotating to next key")
+                if _is_rate_limit_error(e):
+                    time.sleep(_RATE_LIMIT_BACKOFF_SECONDS)
                 with _lock:
                     if _key_idx % len(keys) == idx:  # only advance once per exhaustion
                         _key_idx = (idx + 1) % len(keys)
