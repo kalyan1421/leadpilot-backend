@@ -57,8 +57,97 @@ def _org_context(db: Session, org_id: Optional[str]) -> Optional[Dict[str, Any]]
     }
 
 
+def _pending_follow_up_note(db: Session, org_id: Optional[str], lead_row) -> Optional[str]:
+    """Earliest not-yet-completed follow-up note for this lead, if any — folded
+    into the pre-call brief so a promised callback reason isn't lost between
+    scheduling it and the next call."""
+    if not lead_row or not org_id:
+        return None
+    from app.models import FollowUp
+
+    row = (
+        db.query(FollowUp)
+        .filter(
+            FollowUp.org_id == org_id,
+            FollowUp.lead_id == lead_row.id,
+            FollowUp.completed_at.is_(None),
+        )
+        .order_by(FollowUp.due_at.asc())
+        .first()
+    )
+    return row.note if row and row.note else None
 
 
+def _get_or_build_precall_brief(
+    db: Session,
+    org_id: Optional[str],
+    contact_key: str,
+    bubble_row,
+    lead_row,
+    display_name: str,
+    intent_bucket: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Returns {"brief": ..., "generated_at": iso-str-or-None}, regenerating (and
+    persisting) the brief when missing or stale. Stale = a call has landed for
+    this contact since the brief was last generated
+    (pre_call_brief_total_calls != total_calls) — compared by count rather
+    than timestamp so the same commit that writes the brief can't race itself
+    via updated_at's onupdate.
+
+    Bootstraps a total_calls=0 MemoryBubble row when the lead has no bubble
+    yet (brand-new lead, no calls) so a first-call brief still has somewhere
+    to live and gets cached rather than regenerated on every screen open.
+    Returns the (possibly new) bubble_row is NOT propagated back to the
+    caller — callers that need it should re-query, this function owns its
+    own commit.
+    """
+    from app.models import MemoryBubble
+    from app.utils.precall_brief import generate_precall_brief
+
+    current_total = bubble_row.total_calls if bubble_row else 0
+    if (
+        bubble_row
+        and bubble_row.pre_call_brief
+        and bubble_row.pre_call_brief_total_calls == current_total
+    ):
+        generated_at = (
+            bubble_row.pre_call_brief_generated_at.isoformat()
+            if bubble_row.pre_call_brief_generated_at else None
+        )
+        return {"brief": bubble_row.pre_call_brief, "generated_at": generated_at}
+
+    org_context = _org_context(db, org_id)
+    memory = _serialize_bubble(bubble_row) if bubble_row else None
+    follow_up_note = _pending_follow_up_note(db, org_id, lead_row)
+
+    brief = generate_precall_brief(
+        lead_name=display_name,
+        intent_bucket=intent_bucket,
+        org_context=org_context,
+        memory=memory,
+        follow_up_note=follow_up_note,
+    )
+    if not brief:
+        generated_at = (
+            bubble_row.pre_call_brief_generated_at.isoformat()
+            if bubble_row and bubble_row.pre_call_brief_generated_at else None
+        )
+        return {"brief": bubble_row.pre_call_brief if bubble_row else None, "generated_at": generated_at}
+
+    if not bubble_row:
+        import uuid as _uuid
+        bubble_row = MemoryBubble(
+            id=str(_uuid.uuid4()), contact_key=contact_key, org_id=org_id, total_calls=0,
+        )
+        db.add(bubble_row)
+
+    now = datetime.utcnow()
+    bubble_row.pre_call_brief = brief
+    bubble_row.pre_call_brief_generated_at = now
+    bubble_row.pre_call_brief_total_calls = current_total
+    db.commit()
+    return {"brief": brief, "generated_at": now.isoformat()}
 
 
 
@@ -1271,6 +1360,39 @@ def _all_analyses_by_contact(
     return grouped
 
 
+def _pick_telecaller_for_assignment(db: Session, org_id: str) -> Optional[str]:
+    """
+    Round-robin lead assignment (LEAD_ASSIGNMENT_SPEC P0-1), implemented as
+    least-loaded selection: picks the active telecaller in this org with the
+    fewest currently-assigned leads, tie-broken by User.id ascending for
+    determinism. This self-corrects if telecallers are added/removed/
+    deactivated, unlike a persisted "next up" cursor which can drift out of
+    sync.
+
+    Returns None if the org has zero active telecallers — callers should
+    leave Lead.assigned_to as NULL in that case (visible to founder/ad_manager
+    only until a telecaller becomes active).
+    """
+    from app.models import User, Lead
+    from sqlalchemy import func
+
+    telecallers = (
+        db.query(User)
+        .filter(User.org_id == org_id, User.role == "telecaller", User.is_active == True)  # noqa: E712
+        .order_by(User.id.asc())
+        .all()
+    )
+    if not telecallers:
+        return None
+    load_counts = dict(
+        db.query(Lead.assigned_to, func.count(Lead.id))
+        .filter(Lead.org_id == org_id, Lead.assigned_to.isnot(None))
+        .group_by(Lead.assigned_to)
+        .all()
+    )
+    return min(telecallers, key=lambda t: (load_counts.get(t.id, 0), t.id)).id
+
+
 @intel_router.get("/inbox", status_code=status.HTTP_200_OK)
 async def get_inbox(
     bucket: Optional[str] = None,
@@ -1283,12 +1405,29 @@ async def get_inbox(
 
     Org-scoped: a telecaller only ever sees their own org's leads (previously
     this queried across all orgs — a cross-tenant data leak).
+
+    Per-telecaller scoped (LEAD_ASSIGNMENT_SPEC P0-2), gated behind the
+    per-org strict_lead_scoping rollout flag (P0-4): when the org has opted
+    in AND the caller is a telecaller, only leads assigned to them (plus
+    call-only entries attributed to their own AudioCall.telecaller_id) are
+    returned. Founder/ad_manager, and telecallers in orgs that haven't opted
+    in yet, keep today's org-wide visibility.
     """
     from app.models import Lead
     from app.utils.lead_intelligence import lead_card, inbox_header
 
-    grouped = _all_analyses_by_contact(db, current_user.org_id)
-    leads = db.query(Lead).filter(Lead.org_id == current_user.org_id).all()
+    scoped = bool(current_user.organization.strict_lead_scoping) and current_user.role == "telecaller"
+
+    if scoped:
+        grouped = _all_analyses_by_contact(db, current_user.org_id, telecaller_id=current_user.id)
+        leads = (
+            db.query(Lead)
+            .filter(Lead.org_id == current_user.org_id, Lead.assigned_to == current_user.id)
+            .all()
+        )
+    else:
+        grouped = _all_analyses_by_contact(db, current_user.org_id)
+        leads = db.query(Lead).filter(Lead.org_id == current_user.org_id).all()
 
     by_key: Dict[str, Dict[str, Any]] = {}
 
@@ -1491,6 +1630,17 @@ async def create_lead(
     org_id = current_user.org_id
     telecaller_id = current_user.id
 
+    # LEAD_ASSIGNMENT_SPEC P0-1: a telecaller creating a lead remains its
+    # owner (self-assignment, as today). A founder/ad_manager (or any future
+    # role) creating a lead on behalf of the team must NOT become its
+    # telecaller owner — that would make it invisible to every actual
+    # telecaller once P0-2 scoping is live. Round-robin assign instead.
+    assigned_to = (
+        telecaller_id
+        if current_user.role == "telecaller"
+        else _pick_telecaller_for_assignment(db, org_id)
+    )
+
     contact_key = slugify_contact(name)
     existing = (
         db.query(Lead)
@@ -1514,7 +1664,7 @@ async def create_lead(
         source=payload.get("source"),
         status="new",
         org_id=org_id,
-        assigned_to=telecaller_id,
+        assigned_to=assigned_to,
     )
     db.add(lead)
     try:
@@ -1537,7 +1687,7 @@ async def create_lead(
         # real DB error and surface a clear 409 instead of an opaque 500.
         logger.error(
             "create_lead IntegrityError (org=%s assigned_to=%s contact_key=%s): %s",
-            org_id, telecaller_id, contact_key, getattr(exc, "orig", exc),
+            org_id, assigned_to, contact_key, getattr(exc, "orig", exc),
         )
         raise HTTPException(
             status_code=409,
@@ -1562,11 +1712,18 @@ async def get_lead_detail(
     while this endpoint had an optional-auth fallback. Both the Flutter app
     (HttpApiClient, real login flow) and the web app (authedRequest) already
     call this only when authenticated.
+
+    Per-telecaller scoped (LEAD_ASSIGNMENT_SPEC P0-2), gated behind the
+    per-org strict_lead_scoping rollout flag (P0-4) — same "scoped" check as
+    get_inbox. When scoped, a lead assigned to a different telecaller 404s
+    (not 403) so the response doesn't confirm the lead exists under someone
+    else's ownership.
     """
     from app.models import MemoryBubble, Lead
     from app.utils.lead_intelligence import lead_card
 
     org_id = current_user.org_id
+    scoped = bool(current_user.organization.strict_lead_scoping) and current_user.role == "telecaller"
     # Card summary (lead score/verdict/tags) AND call history both include
     # not_relevant calls now: the analyzer scores every dimension on its own
     # merits even for off-topic calls (a genuine wrong number simply scores low
@@ -1576,7 +1733,8 @@ async def get_lead_detail(
     # dashboard and the scoring rings keep _all_analyses_by_contact's
     # "completed"-only default.)
     history_analyses = _all_analyses_by_contact(
-        db, org_id, include_statuses=("completed", "not_relevant")
+        db, org_id, include_statuses=("completed", "not_relevant"),
+        telecaller_id=current_user.id if scoped else None,
     ).get(contact_key, [])
     analyses = history_analyses
     lead_row = (
@@ -1586,6 +1744,11 @@ async def get_lead_detail(
     )
 
     if not history_analyses and not lead_row:
+        raise HTTPException(status_code=404, detail=f"No lead or calls for contact {contact_key}")
+
+    if scoped and lead_row and lead_row.assigned_to != current_user.id:
+        # Don't leak that the lead exists under a different owner — same
+        # message/status as the genuine not-found case above.
         raise HTTPException(status_code=404, detail=f"No lead or calls for contact {contact_key}")
 
     display_name = (lead_row.name if lead_row else None) or contact_key.replace("_", " ").title()
@@ -1602,6 +1765,13 @@ async def get_lead_detail(
         .first()
     )
     memory = _serialize_bubble(bubble_row) if bubble_row else None
+
+    # Pre-Call screen brief (opening line / key points / script steps /
+    # objection responses / dynamic checklist) — cached on the bubble, only
+    # regenerated when a new call has landed since it was last built.
+    brief_result = _get_or_build_precall_brief(
+        db, org_id, contact_key, bubble_row, lead_row, display_name, card.get("intent_bucket"),
+    )
 
     calls = [
         {
@@ -1624,6 +1794,56 @@ async def get_lead_detail(
         "pipeline_stage": lead_row.pipeline_stage if lead_row else None,
         "memory": memory,
         "calls": calls,
+        "pre_call_brief": brief_result["brief"],
+        "pre_call_brief_generated_at": brief_result["generated_at"],
+    }
+
+
+@intel_router.post("/leads/{contact_key}/pre-call-brief/rebuild", status_code=status.HTTP_200_OK)
+async def rebuild_precall_brief(
+    contact_key: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(_get_current_user),
+):
+    """Force-regenerate the pre-call brief for a contact — mirrors
+    /api/memory/{contact_key}/rebuild for when a telecaller wants a fresh
+    script without waiting for a new call to land."""
+    from app.models import Lead, MemoryBubble
+    from app.utils.lead_intelligence import lead_card
+
+    org_id = current_user.org_id
+    lead_row = (
+        db.query(Lead)
+        .filter(Lead.contact_key == contact_key, Lead.org_id == org_id)
+        .first()
+    )
+    bubble_row = (
+        db.query(MemoryBubble)
+        .filter(MemoryBubble.contact_key == contact_key, MemoryBubble.org_id == org_id)
+        .first()
+    )
+    if not lead_row and not bubble_row:
+        raise HTTPException(status_code=404, detail=f"No lead or calls for contact {contact_key}")
+
+    history_analyses = _all_analyses_by_contact(
+        db, org_id, include_statuses=("completed", "not_relevant"),
+    ).get(contact_key, [])
+    display_name = (lead_row.name if lead_row else None) or contact_key.replace("_", " ").title()
+    intent_bucket = lead_card(contact_key, history_analyses, name=display_name).get("intent_bucket")
+
+    # Invalidate the cache so _get_or_build_precall_brief always regenerates,
+    # regardless of whether total_calls actually changed.
+    if bubble_row:
+        bubble_row.pre_call_brief = None
+        db.commit()
+
+    brief_result = _get_or_build_precall_brief(
+        db, org_id, contact_key, bubble_row, lead_row, display_name, intent_bucket,
+    )
+    return {
+        "contact_key": contact_key,
+        "pre_call_brief": brief_result["brief"],
+        "pre_call_brief_generated_at": brief_result["generated_at"],
     }
 
 
@@ -1994,16 +2214,34 @@ async def upload_recording(
     # Org-scoped: contact_key is only unique per-org (see uq_leads_org_contact_key),
     # so an unscoped lookup here could match — or fail to match — another org's lead.
     lead = db.query(Lead).filter(Lead.contact_key == slug, Lead.org_id == org_id).first()
+    # LEAD_ASSIGNMENT_SPEC P0-1: a telecaller uploading a call remains the
+    # lead's owner (self-assignment, as today). A founder/ad_manager (or any
+    # future role) uploading on behalf of the team must NOT become the
+    # telecaller owner — round-robin assign instead. Assignment is sticky: an
+    # already-assigned lead's owner is never overwritten by this logic — only
+    # used to fill in an assignment that's still NULL. (Note: AudioCall.telecaller_id
+    # below is a different field — "who placed/uploaded this call" — and always
+    # stamps current_user.id regardless of role.)
     if not lead:
+        assigned_to = (
+            telecaller_id
+            if current_user.role == "telecaller"
+            else _pick_telecaller_for_assignment(db, org_id)
+        )
         lead = Lead(id=str(_uuid.uuid4()), contact_key=slug, name=name, phone=phone,
-                    source=source, status="contacted", org_id=org_id, assigned_to=telecaller_id)
+                    source=source, status="contacted", org_id=org_id, assigned_to=assigned_to)
         db.add(lead)
     else:
         lead.phone = phone or lead.phone
         lead.source = source or lead.source
         lead.status = "contacted"
         lead.org_id = lead.org_id or org_id
-        lead.assigned_to = lead.assigned_to or telecaller_id
+        if lead.assigned_to is None:
+            lead.assigned_to = (
+                telecaller_id
+                if current_user.role == "telecaller"
+                else _pick_telecaller_for_assignment(db, org_id)
+            )
     db.commit()
 
     # Persist the upload to a temp file, then into local storage.

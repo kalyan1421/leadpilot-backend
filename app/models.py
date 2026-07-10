@@ -54,6 +54,12 @@ class Organization(Base):
     # simply gets no target-based breakdown (never a fabricated number).
     monthly_revenue_target = Column(Integer, nullable=True)
 
+    # Per-org rollout flag (LEAD_ASSIGNMENT_SPEC P0-4): gates per-telecaller
+    # lead scoping in get_inbox/get_lead_detail. False (today's org-wide
+    # visibility) until an org explicitly opts in, so no org's behavior
+    # changes on deploy.
+    strict_lead_scoping = Column(Boolean, nullable=False, default=False)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -284,6 +290,17 @@ class MemoryBubble(Base):
     pending_commitments = Column(JSON, nullable=True)
     next_call_strategy = Column(Text, nullable=True)
     headline = Column(Text, nullable=True)
+
+    # Pre-Call screen brief — opening line/key points/script steps/objection
+    # responses/checklist, generated from the org KB + the facts above (see
+    # app/utils/precall_brief.py). Cached here (not regenerated every screen
+    # open). pre_call_brief_total_calls snapshots total_calls as of generation
+    # so get_lead_detail can tell it's stale (a new call landed since) without
+    # relying on updated_at ordering, which the same commit that writes the
+    # brief would otherwise also bump.
+    pre_call_brief = Column(JSON, nullable=True)
+    pre_call_brief_generated_at = Column(DateTime(timezone=True), nullable=True)
+    pre_call_brief_total_calls = Column(Integer, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

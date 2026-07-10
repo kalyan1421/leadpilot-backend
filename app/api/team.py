@@ -123,10 +123,23 @@ async def invite_member(
     if body.role not in VALID_ROLES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"role must be one of {sorted(VALID_ROLES)}")
     email = body.email.lower()
-    if db.query(User).filter(func.lower(User.email) == email).first() is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="Email already registered")
-    if body.phone and db.query(User).filter(User.phone == body.phone).first() is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="Phone already registered")
+    existing_by_email = db.query(User).filter(func.lower(User.email) == email).first()
+    if existing_by_email is not None:
+        if existing_by_email.org_id == current_user.org_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail=f"{existing_by_email.name} is already on your team with this email",
+            )
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="This email is already registered to another account")
+    if body.phone:
+        existing_by_phone = db.query(User).filter(User.phone == body.phone).first()
+        if existing_by_phone is not None:
+            if existing_by_phone.org_id == current_user.org_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail=f"{existing_by_phone.name} is already on your team with this phone number",
+                )
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="This phone number is already registered to another account")
 
     temp_password = _generate_temp_password()
     user = User(
