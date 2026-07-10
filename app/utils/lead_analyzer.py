@@ -138,6 +138,12 @@ _SCORING_SCHEMA: Dict[str, Any] = {
     ],
 }
 
+_SENTIMENT_LABELS = ["frustrated", "cautious", "neutral", "interested"]
+_INTENT_TAGS = [
+    "introduction", "discovery", "pitch", "objection", "buy_signal",
+    "defer", "close", "small_talk", "neutral",
+]
+
 _SENTIMENT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -147,7 +153,15 @@ _SENTIMENT_SCHEMA: Dict[str, Any] = {
                 "turn": {"type": "integer"},
                 "role": {"type": "string"},
                 "score": {"type": "number"},
-                "label": {"type": "string"},
+                # Enum-constrained (was free-text): an unconstrained label let
+                # the model mash sentiment + intent into one verbose string
+                # (e.g. "greeting (small_talk)"), which on longer calls
+                # inflated the response past max_tokens and truncated the
+                # JSON mid-object — the whole sentiment_arc then came back
+                # empty even though scoring/BANT succeeded. Matches the same
+                # 4-value vocabulary sentiment_timeline() already computes
+                # deterministically (lead_intelligence.sentiment_label).
+                "label": {"type": "string", "enum": _SENTIMENT_LABELS},
             },
             "required": ["turn", "score"],
         }},
@@ -156,7 +170,7 @@ _SENTIMENT_SCHEMA: Dict[str, Any] = {
             "properties": {
                 "turn": {"type": "integer"},
                 "role": {"type": "string"},
-                "intent": {"type": "string"},
+                "intent": {"type": "string", "enum": _INTENT_TAGS},
             },
             "required": ["turn", "intent"],
         }},
@@ -211,9 +225,11 @@ _SCORING_SYS = (
 )
 _SENTIMENT_SYS = (
     "You are a sentiment analyst. For EACH turn shown, output one arc entry: the same turn number, "
-    "the role, a sentiment score from -1.0 (very negative) to 1.0 (very positive), and a short label. "
-    "Score the PROSPECT's emotion on USER turns and the agent's tone on AGENT turns. Also tag each "
-    "turn's intent (introduction|discovery|pitch|objection|buy_signal|defer|close|small_talk|neutral)."
+    "the role, a sentiment score from -1.0 (very negative) to 1.0 (very positive), and label = EXACTLY "
+    "ONE of frustrated|cautious|neutral|interested (never combine it with the intent tag below). "
+    "Score the PROSPECT's emotion on USER turns and the agent's tone on AGENT turns. Separately, tag "
+    "each turn's intent as EXACTLY ONE of "
+    "introduction|discovery|pitch|objection|buy_signal|defer|close|small_talk|neutral."
 )
 _DIGEST_SYS = (
     "You are summarising ONE part of a longer sales call. Capture what happened, buying signals, "
@@ -272,16 +288,17 @@ class LeadAnalyzer:
 
     # -- LLM calls (with light retry) --------------------------------------
 
-    def _call(self, messages: List[Dict[str, str]], schema: Dict[str, Any], tool: str) -> Dict[str, Any]:
+    def _call(self, messages: List[Dict[str, str]], schema: Dict[str, Any], tool: str,
+              max_tokens: int = 4000) -> Dict[str, Any]:
         last = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 if self.provider == "gemini":
                     from app.utils.gemini import gemini_extract
                     return gemini_extract(messages, schema=schema, tool_name=tool,
-                                          model=self.model, max_tokens=4000)
+                                          model=self.model, max_tokens=max_tokens)
                 return sarvam_extract(messages, schema=schema, tool_name=tool,
-                                      model=self.model, max_tokens=4000)
+                                      model=self.model, max_tokens=max_tokens)
             except Exception as e:
                 last = e
                 logger.warning(f"{tool} attempt {attempt + 1} failed: {str(e)[:120]}")
@@ -293,8 +310,14 @@ class LeadAnalyzer:
         def one(c):
             msgs = [{"role": "system", "content": _SENTIMENT_SYS},
                     {"role": "user", "content": "TRANSCRIPT:\n" + self._numbered(c["turns"], c["start"])}]
+            # Two array entries (arc + intent) per turn, now enum-constrained
+            # (cheap tokens) rather than free-text — but still scale with
+            # chunk size so a long chunk's response can't get truncated
+            # mid-JSON the way an unconstrained label previously could at a
+            # flat 4000-token budget (see _SENTIMENT_SCHEMA's label enum).
+            budget = max(4000, len(c["turns"]) * 120)
             try:
-                return self._call(msgs, _SENTIMENT_SCHEMA, "record_sentiment")
+                return self._call(msgs, _SENTIMENT_SCHEMA, "record_sentiment", max_tokens=budget)
             except Exception as e:
                 logger.warning(f"sentiment chunk @ {c['start']} failed: {str(e)[:80]}")
                 return None
