@@ -148,6 +148,28 @@ def _avg(nums: List[float]) -> Optional[float]:
     return round(sum(nums) / len(nums), 1) if nums else None
 
 
+# The six scored dimensions of an agent_debrief. Summing their averaged values
+# gives the /110 composite "quality" score used across the founder portal
+# (5 skill dims * 20pts + punctuality * 10pts). Kept here — the single source of
+# truth — so the team, performance, and comparison surfaces can't drift apart
+# (which is exactly what happened when the Manage Team page averaged the raw
+# 0-100 agent_debrief.total_score instead).
+DEBRIEF_DIMENSIONS = ["opening", "discovery", "pitch", "objection_handling", "closing", "punctuality"]
+
+
+def averaged_debrief_dimensions(debriefs: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Mean score per dimension across the given agent_debrief dicts. Missing or
+    non-numeric dimension scores contribute 0. `sum(result.values())` is the
+    /110 composite quality; callers decide how to treat an empty debrief list
+    (0 for aggregate math, None for a "no calls yet" display)."""
+    dims: Dict[str, int] = {}
+    valid = [d for d in debriefs if isinstance(d, dict)]
+    for dim in DEBRIEF_DIMENSIONS:
+        vals = [d[f"{dim}_score"] for d in valid if isinstance(d.get(f"{dim}_score"), (int, float))]
+        dims[dim] = round(sum(vals) / len(vals)) if vals else 0
+    return dims
+
+
 def telecaller_score(
     calls: List[Dict[str, Any]],
     *,

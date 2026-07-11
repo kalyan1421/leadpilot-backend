@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user
 from app.database import get_db
 from app.models import Attendance, AudioCall, Lead, LeadAnalysis, Organization, User
-from app.utils.lead_intelligence import mmss_to_seconds
+from app.utils.lead_intelligence import DEBRIEF_DIMENSIONS, averaged_debrief_dimensions, mmss_to_seconds
 from app.utils.memory_bubble import contact_key_from_call_id
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ KANBAN_STAGES = [
     "Negotiation", "Closed Won", "Closed Lost", "Junk",
 ]
 
-_DIMENSIONS = ["opening", "discovery", "pitch", "objection_handling", "closing", "punctuality"]
+_DIMENSIONS = DEBRIEF_DIMENSIONS
 
 
 # ---------------------------------------------------------------------------
@@ -204,12 +204,11 @@ def _compute_telecaller_metrics(
 
     debriefs = [analyses[c.call_id].agent_debrief for c in calls
                 if c.call_id in analyses and isinstance(analyses[c.call_id].agent_debrief, dict)]
-    dims = {}
-    for dim in _DIMENSIONS:
-        vals = [d[f"{dim}_score"] for d in debriefs if isinstance(d.get(f"{dim}_score"), (int, float))]
-        dims[dim] = round(sum(vals) / len(vals)) if vals else 0
     # 5 dims * 20pts + punctuality * 10pts = /110 (punctuality is additive, see
     # lead_analyzer.py — doesn't change what the original 5 dims/scale mean).
+    # Shared with the Manage Team page via averaged_debrief_dimensions so the
+    # same telecaller can't show two different quality numbers.
+    dims = averaged_debrief_dimensions(debriefs)
     quality = round(sum(dims.values())) if debriefs else 0
 
     talk_times = []
@@ -542,7 +541,30 @@ async def get_coaching_queue(
             for c in calls_by_tc.get(tc.id, [])
             if c.call_id in analyses_by_call_id and isinstance(analyses_by_call_id[c.call_id].agent_debrief, dict)
         ]
+        # Telecallers with no scored calls used to be dropped here, which made an
+        # otherwise-empty queue read as "the whole team is above threshold" even
+        # when someone had a 0/110 (i.e. no reviewed calls at all). Surface these
+        # as their own queue items instead of hiding them.
+        if len(debriefs) == 0:
+            queue.append({
+                "telecaller_id": tc.id,
+                "telecaller_name": tc.name,
+                "issue": f"No scored calls in the last {_COACHING_WINDOW_DAYS} days — nothing to coach on yet",
+                "recommended_action": "Check that this telecaller is active and their calls are being recorded and analysed.",
+                "priority": "High",
+            })
+            continue
         if len(debriefs) < _COACHING_MIN_CALLS:
+            queue.append({
+                "telecaller_id": tc.id,
+                "telecaller_name": tc.name,
+                "issue": (
+                    f"Only {len(debriefs)} scored call(s) in the last {_COACHING_WINDOW_DAYS} days — "
+                    "too few to assess dimensions reliably"
+                ),
+                "recommended_action": "Revisit once there are a few more scored calls this period.",
+                "priority": "Low",
+            })
             continue
 
         for dim, threshold in _COACHING_THRESHOLDS.items():

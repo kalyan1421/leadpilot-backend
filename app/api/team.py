@@ -9,7 +9,7 @@ import logging
 import secrets
 import string
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
 from app.models import AudioCall, Lead, LeadAnalysis, User
+from app.utils.lead_intelligence import averaged_debrief_dimensions
 from app.schemas_team import (
     InviteMemberRequest,
     InviteMemberResponse,
@@ -64,23 +65,34 @@ def _member_metrics_batch(db: Session, user_ids: List[str]) -> Dict[str, Dict[st
         .all()
     )
 
-    scores_by_user: Dict[str, List[float]] = {}
+    debriefs_by_user: Dict[str, List[Dict[str, Any]]] = {}
     for telecaller_id, agent_debrief in (
         db.query(AudioCall.telecaller_id, LeadAnalysis.agent_debrief)
         .join(LeadAnalysis, LeadAnalysis.call_id == AudioCall.call_id)
-        .filter(AudioCall.telecaller_id.in_(user_ids), LeadAnalysis.agent_debrief.isnot(None))
+        .filter(
+            AudioCall.telecaller_id.in_(user_ids),
+            LeadAnalysis.status == "completed",
+            LeadAnalysis.agent_debrief.isnot(None),
+        )
         .all()
     ):
-        if isinstance(agent_debrief, dict) and agent_debrief.get("total_score") is not None:
-            scores_by_user.setdefault(telecaller_id, []).append(agent_debrief["total_score"])
+        if isinstance(agent_debrief, dict):
+            debriefs_by_user.setdefault(telecaller_id, []).append(agent_debrief)
 
     result = {}
     for uid in user_ids:
-        scores = scores_by_user.get(uid)
+        # Same /110 composite the Performance and Comparison pages use
+        # (5 skill dims * 20 + punctuality * 10), via the shared helper — this
+        # page used to average the raw 0-100 agent_debrief.total_score, so the
+        # same telecaller showed a different, lower quality number here. None
+        # when there are no scored calls yet, so the UI shows "No calls yet"
+        # rather than a misleading 0/110.
+        debriefs = debriefs_by_user.get(uid, [])
+        dims = averaged_debrief_dimensions(debriefs)
         result[uid] = {
             "calls": calls_by_user.get(uid, 0),
             "leads": leads_by_user.get(uid, 0),
-            "quality": round(sum(scores) / len(scores)) if scores else None,
+            "quality": round(sum(dims.values())) if debriefs else None,
             "last_active": last_active_by_user.get(uid),
         }
     return result
