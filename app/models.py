@@ -46,7 +46,12 @@ class Organization(Base):
     # Shown on the telecaller mobile app's Profile screen so a telecaller sees
     # who they work for, not just their own name. Set from the founder web
     # app's org settings page; nullable since no existing org has these yet.
-    logo_url = Column(String(500), nullable=True)
+    # TEXT, not VARCHAR: the founder onboarding/settings logo upload sends the
+    # image inline as a base64 data URL (see leadpilot-web logo dropzone), which
+    # for any real image is far larger than a 500-char cap. A narrow width here
+    # rejected every logo upload — 422 at the schema, or a Postgres "value too
+    # long" 500 if the schema cap were lifted alone.
+    logo_url = Column(Text, nullable=True)
     address = Column(Text, nullable=True)
 
     # Revenue goal tracking — drives the Monthly Goal gauge and the revenue

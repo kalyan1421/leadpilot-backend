@@ -49,8 +49,11 @@ class OrgProfileRequest(BaseModel):
 
     # max_length on the string fields mirrors the Organization column widths so
     # overlong input is rejected with a clean 422 instead of hitting a Postgres
-    # "value too long" DataError → opaque 500. target_audience/address are TEXT
-    # (unbounded) and the list fields are JSON (no width limit), so no cap there.
+    # "value too long" DataError → opaque 500. target_audience/address/logo_url
+    # are TEXT (unbounded) and the list fields are JSON (no width limit), so no
+    # cap there. logo_url in particular carries a base64 data URL from the logo
+    # upload, which is far larger than any VARCHAR width — capping it rejected
+    # every logo upload during onboarding.
     name: Optional[str] = Field(None, min_length=2, max_length=255)
     industry: Optional[str] = Field(None, max_length=100)
     website_url: Optional[str] = Field(None, max_length=500)
@@ -63,7 +66,7 @@ class OrgProfileRequest(BaseModel):
     languages: Optional[List[str]] = None
     usps: Optional[List[str]] = None
     monthly_revenue_target: Optional[int] = None
-    logo_url: Optional[str] = Field(None, max_length=500)
+    logo_url: Optional[str] = None
     address: Optional[str] = None
 
 
