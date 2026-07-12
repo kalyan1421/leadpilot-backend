@@ -8,12 +8,13 @@ import uuid
 from typing import Optional
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.ratelimit import limiter
 from app.models import Organization, User
 from app.schemas_auth import (
     ChangePasswordRequest,
@@ -125,7 +126,8 @@ def require_role(*roles: str):
 
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/hour")
+async def register(request: Request, body: RegisterRequest, db: Session = Depends(get_db)):
     """Create a new org and its first user (role=founder). One call, not two, so the
     founder onboarding flow never ends up with an org and no owner."""
     email = body.email.lower()
@@ -153,7 +155,8 @@ async def register(body: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
     email = body.email.lower()
     user = db.query(User).filter(func.lower(User.email) == email).first()
     if user is None:
@@ -180,7 +183,9 @@ async def me(current_user: User = Depends(get_current_user)):
 
 
 @router.post("/change-password", response_model=UserResponse)
+@limiter.limit("10/minute")
 async def change_password(
+    request: Request,
     body: ChangePasswordRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

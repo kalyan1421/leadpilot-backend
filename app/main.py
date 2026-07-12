@@ -5,7 +5,10 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
+from app.ratelimit import limiter
 from app.api.attendance import router as attendance_router
 from app.api.auth import router as auth_router
 from app.api.calls import router as calls_router
@@ -29,6 +32,12 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# Rate limiting (slowapi): per-route @limiter.limit(...) decorators (see
+# app/api/auth.py) need the limiter on app.state, plus a handler that turns an
+# exceeded limit into a 429 instead of falling through to the generic 500 below.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Add CORS middleware
 _cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
