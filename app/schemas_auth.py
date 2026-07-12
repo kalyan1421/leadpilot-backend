@@ -1,8 +1,21 @@
 """Pydantic schemas for the org/user/auth module."""
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import AfterValidator, BaseModel, EmailStr, Field
+
+
+def _within_bcrypt_limit(v: str) -> str:
+    """bcrypt silently ignores everything past 72 BYTES, so a longer password is
+    quietly truncated — two different long passwords sharing a 72-byte prefix
+    would both authenticate. Reject the overflow instead of truncating."""
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("Password must be at most 72 bytes long.")
+    return v
+
+
+# Password with an 8-char floor and a hard 72-byte ceiling (bcrypt's real limit).
+Password = Annotated[str, Field(min_length=8), AfterValidator(_within_bcrypt_limit)]
 
 
 class RegisterRequest(BaseModel):
@@ -11,7 +24,7 @@ class RegisterRequest(BaseModel):
     org_name: str = Field(min_length=2, max_length=255)
     name: str = Field(min_length=1, max_length=255)
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    password: Password
 
 
 class LoginRequest(BaseModel):
@@ -40,7 +53,7 @@ class TokenResponse(BaseModel):
 
 class ChangePasswordRequest(BaseModel):
     current_password: str
-    new_password: str = Field(min_length=8, max_length=128)
+    new_password: Password
 
 
 class AlertConfig(BaseModel):

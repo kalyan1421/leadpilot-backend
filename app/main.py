@@ -41,10 +41,15 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Add CORS middleware
 _cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+# allow_credentials with a wildcard origin is an invalid combo (browsers ignore
+# it) and is flagged by scanners. This API authenticates with bearer tokens in
+# the Authorization header, not cookies, so credentialed CORS isn't needed when
+# origins are wildcarded — only enable it when explicit origins are configured.
+_allow_credentials = "*" not in _cors_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
