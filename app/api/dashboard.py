@@ -597,17 +597,30 @@ async def get_coaching_queue(
 # Founder home dashboard snapshot
 # ---------------------------------------------------------------------------
 
-def _snapshot(db: Session, org_id: str) -> Dict[str, Any]:
+def _snapshot(
+    db: Session,
+    org_id: str,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> Dict[str, Any]:
     today = datetime.now(timezone.utc).date()
     start_of_today = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
     start_of_tomorrow = start_of_today + timedelta(days=1)
+
+    # New-lead and call counts are scoped to the [start, end) window when the
+    # caller supplies a date range (the Daily Snapshot date picker); otherwise
+    # they fall back to "today". Pipeline totals / hot / conversion below are
+    # current-state and not range-dependent.
+    win_start = start if start is not None else start_of_today
+    win_end = end if end is not None else start_of_tomorrow
+    ranged = start is not None or end is not None
 
     leads_today = (
         db.query(Lead)
         .filter(
             Lead.org_id == org_id,
-            Lead.created_at >= start_of_today,
-            Lead.created_at < start_of_tomorrow,
+            Lead.created_at >= win_start,
+            Lead.created_at < win_end,
         )
         .count()
     )
@@ -615,8 +628,8 @@ def _snapshot(db: Session, org_id: str) -> Dict[str, Any]:
         db.query(AudioCall)
         .filter(
             AudioCall.org_id == org_id,
-            AudioCall.timestamp >= start_of_today,
-            AudioCall.timestamp < start_of_tomorrow,
+            AudioCall.timestamp >= win_start,
+            AudioCall.timestamp < win_end,
         )
         .count()
     )
@@ -638,15 +651,40 @@ def _snapshot(db: Session, org_id: str) -> Dict[str, Any]:
         "hot_leads": hot_leads,
         "conversion_rate_pct": conversion_rate_pct,
         "total_leads": total_leads,
+        "ranged": ranged,
     }
+
+
+def _parse_snapshot_date(value: Optional[str], *, field: str) -> Optional[datetime]:
+    """Parse a YYYY-MM-DD query param to a UTC midnight datetime, or None."""
+    if not value:
+        return None
+    try:
+        d = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field} must be a YYYY-MM-DD date",
+        )
+    return datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc)
 
 
 @router.get("/dashboard/snapshot", status_code=status.HTTP_200_OK)
 async def get_dashboard_snapshot(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return _snapshot(db, current_user.org_id)
+    """`start`/`end` (YYYY-MM-DD, inclusive) scope the new-lead and call counts to
+    that window; omit both for today's figures."""
+    s = _parse_snapshot_date(start, field="start")
+    e = _parse_snapshot_date(end, field="end")
+    if e is not None:
+        e = e + timedelta(days=1)  # inclusive end date -> exclusive next-day bound
+    if s is not None and e is not None and e <= s:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="end must be on or after start")
+    return _snapshot(db, current_user.org_id, s, e)
 
 
 # ---------------------------------------------------------------------------
