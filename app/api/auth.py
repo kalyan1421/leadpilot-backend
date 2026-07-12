@@ -32,6 +32,13 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _bearer = HTTPBearer(auto_error=False)
 
+# Fixed bcrypt hash used only to equalise login timing: on the "no such account"
+# path we still run one bcrypt verify against this so the response takes the same
+# ~time as the wrong-password path. Without it, the missing-account path returns
+# much faster (no bcrypt), letting an attacker enumerate registered emails by
+# timing despite the generic error message.
+_DUMMY_PASSWORD_HASH = hash_password("account-enumeration-timing-guard")
+
 
 def _slugify(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
@@ -150,9 +157,11 @@ async def login(body: LoginRequest, db: Session = Depends(get_db)):
     email = body.email.lower()
     user = db.query(User).filter(func.lower(User.email) == email).first()
     if user is None:
-        # Client still gets the generic message (no account-enumeration), but the
-        # server log distinguishes "no such account" from "wrong password" so a
-        # failed login is debuggable without guessing.
+        # Spend the same bcrypt work as the wrong-password path so response timing
+        # can't be used to tell whether an email is registered. Client still gets
+        # the generic message; the server log distinguishes "no such account" from
+        # "wrong password" so a failed login is debuggable without guessing.
+        verify_password(body.password, _DUMMY_PASSWORD_HASH)
         logger.warning("login failed: no account for %s", email)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password")
     if not verify_password(body.password, user.hashed_password):
