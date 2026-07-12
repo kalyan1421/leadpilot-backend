@@ -17,7 +17,11 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
 from app.models import Attendance, User
-from app.schemas_attendance import AttendanceListResponse, AttendanceRecordResponse
+from app.schemas_attendance import (
+    AttendanceCorrectionRequest,
+    AttendanceListResponse,
+    AttendanceRecordResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,13 @@ def _today_ist() -> date_type:
     return datetime.now(IST).date()
 
 
+# A shift open longer than this is treated as a forgotten checkout: it's
+# auto-closed (on read) at check_in + cap so it never stays "In progress"
+# forever and hours can still be computed. 12h comfortably covers a real long
+# shift while catching the "closed the app / phone died / forgot" case.
+MAX_SHIFT_HOURS = 12
+
+
 def _hours_worked(check_in_at: Optional[datetime], check_out_at: Optional[datetime]) -> Optional[float]:
     if check_in_at is None or check_out_at is None:
         return None
@@ -41,7 +52,21 @@ def _hours_worked(check_in_at: Optional[datetime], check_out_at: Optional[dateti
     return round(delta.total_seconds() / 3600, 2)
 
 
+def _effective_checkout(record: Attendance, now: datetime) -> tuple[Optional[datetime], str]:
+    """(effective checkout, status). A real checkout wins; an open shift past the
+    max-shift cap is auto-closed at check_in + cap ("forgotten checkout"); an
+    open shift within the cap is genuinely on-shift (no hours yet)."""
+    if record.check_out_at is not None:
+        return record.check_out_at, "completed"
+    if record.check_in_at is None:
+        return None, "on_shift"
+    if now - record.check_in_at >= timedelta(hours=MAX_SHIFT_HOURS):
+        return record.check_in_at + timedelta(hours=MAX_SHIFT_HOURS), "auto_closed"
+    return None, "on_shift"
+
+
 def _to_record_response(record: Attendance, telecaller_name: Optional[str] = None) -> AttendanceRecordResponse:
+    effective_out, status = _effective_checkout(record, datetime.now(timezone.utc))
     return AttendanceRecordResponse(
         id=record.id,
         user_id=record.user_id,
@@ -49,7 +74,9 @@ def _to_record_response(record: Attendance, telecaller_name: Optional[str] = Non
         date=record.date,
         check_in_at=record.check_in_at,
         check_out_at=record.check_out_at,
-        hours_worked=_hours_worked(record.check_in_at, record.check_out_at),
+        effective_check_out_at=effective_out,
+        hours_worked=_hours_worked(record.check_in_at, effective_out),
+        status=status,
     )
 
 
@@ -154,3 +181,78 @@ async def list_attendance(
 
     records = [_to_record_response(record, telecaller_name=user.name) for record, user in rows]
     return AttendanceListResponse(records=records)
+
+
+@router.get("/mine", response_model=AttendanceListResponse)
+async def list_my_attendance(
+    days: int = Query(7, ge=1, le=90),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The caller's own recent attendance — history plus any open past shift the
+    telecaller app should prompt them to close."""
+    since = _today_ist() - timedelta(days=days)
+    rows = (
+        db.query(Attendance)
+        .filter(Attendance.user_id == current_user.id, Attendance.date >= since)
+        .order_by(Attendance.date.desc())
+        .all()
+    )
+    return AttendanceListResponse(records=[_to_record_response(r) for r in rows])
+
+
+@router.post("/{record_id}/close", response_model=AttendanceRecordResponse)
+async def close_own_shift(
+    record_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Telecaller closes their OWN still-open shift (e.g. one they forgot to check
+    out of on a previous day). Closes at 'now', but never later than the auto-cap,
+    so a long-forgotten shift lands on the honest capped time rather than an
+    inflated multi-day duration."""
+    record = (
+        db.query(Attendance)
+        .filter(Attendance.id == record_id, Attendance.user_id == current_user.id)
+        .first()
+    )
+    if record is None or record.check_in_at is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="No such open shift")
+    if record.check_out_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Shift already closed")
+
+    now = datetime.now(timezone.utc)
+    capped = record.check_in_at + timedelta(hours=MAX_SHIFT_HOURS)
+    record.check_out_at = min(now, capped)
+    db.commit()
+    db.refresh(record)
+    return _to_record_response(record)
+
+
+@router.patch("/{record_id}", response_model=AttendanceRecordResponse)
+async def correct_attendance(
+    record_id: str,
+    body: AttendanceCorrectionRequest,
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    """Founder/admin correction — set the real check-out time on a record (e.g. a
+    telecaller who forgot to check out). Org-scoped; check-out must be after
+    check-in."""
+    record = (
+        db.query(Attendance)
+        .filter(Attendance.id == record_id, Attendance.org_id == current_user.org_id)
+        .first()
+    )
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Attendance record not found")
+    if record.check_in_at is None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Record has no check-in to close")
+    if body.check_out_at <= record.check_in_at:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Check-out must be after check-in")
+
+    record.check_out_at = body.check_out_at
+    db.commit()
+    db.refresh(record)
+    user = db.query(User).filter(User.id == record.user_id).first()
+    return _to_record_response(record, telecaller_name=user.name if user else None)
