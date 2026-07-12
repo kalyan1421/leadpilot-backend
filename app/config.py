@@ -3,7 +3,13 @@
 import os
 from typing import Optional
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
+
+# The built-in JWT secret is intentionally obvious so a misconfigured deploy is
+# caught (see the validator below), not silently shipped. It is public (it's in
+# this file), so any environment using it has fully forgeable tokens.
+_INSECURE_JWT_DEFAULT = "dev-only-insecure-secret-change-me"
 
 
 class Settings(BaseSettings):
@@ -57,14 +63,33 @@ class Settings(BaseSettings):
 
     # Auth — FastAPI is the sole identity provider for web + mobile (no separate NestJS auth).
     # MUST be overridden via .env in any environment beyond a throwaway local sandbox.
-    jwt_secret_key: str = "dev-only-insecure-secret-change-me"
+    jwt_secret_key: str = _INSECURE_JWT_DEFAULT
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
-    
+
     class Config:
         env_file = ".env"
         case_sensitive = False
         extra = "ignore"
+
+    @model_validator(mode="after")
+    def _require_secure_jwt_secret(self):
+        """Refuse to start with a weak/default JWT secret outside local dev.
+
+        HS256 tokens are only as trustworthy as this secret — with the public
+        default, anyone can forge a token for any user/org/role (full auth
+        bypass + cross-tenant access). Fail loudly at boot instead of running
+        forgeable. Local sandboxes set DEBUG=true to keep the convenient default.
+        """
+        if self.debug:
+            return self
+        if self.jwt_secret_key == _INSECURE_JWT_DEFAULT or len(self.jwt_secret_key) < 16:
+            raise ValueError(
+                "JWT_SECRET_KEY is unset/weak. Set a strong random JWT_SECRET_KEY "
+                "(>=16 chars) in the environment for any non-local deployment, or "
+                "set DEBUG=true for a throwaway local sandbox."
+            )
+        return self
 
 
 # Global settings instance
