@@ -43,6 +43,17 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class AlertConfig(BaseModel):
+    """Founder-configurable alert thresholds. All optional; any left None falls
+    back to the insights engine's built-in default. Sent as a whole object by
+    the settings form, so a save never partially clobbers the stored blob."""
+
+    wastage_days: Optional[int] = Field(None, ge=1, le=90)
+    zombie_days: Optional[int] = Field(None, ge=1, le=90)
+    performance_gap: Optional[int] = Field(None, ge=1, le=110)
+    quality_floor: Optional[int] = Field(None, ge=0, le=100)
+
+
 class OrgProfileRequest(BaseModel):
     """All fields optional — the onboarding wizard sends everything at once on
     launch, the settings page sends only what changed on an edit."""
@@ -68,6 +79,7 @@ class OrgProfileRequest(BaseModel):
     monthly_revenue_target: Optional[int] = None
     logo_url: Optional[str] = None
     address: Optional[str] = None
+    alert_config: Optional[AlertConfig] = None
 
 
 class OrgProfileResponse(BaseModel):
@@ -87,6 +99,7 @@ class OrgProfileResponse(BaseModel):
     monthly_revenue_target: Optional[int] = None
     logo_url: Optional[str] = None
     address: Optional[str] = None
+    alert_config: Optional[AlertConfig] = None
 
     class Config:
         from_attributes = True

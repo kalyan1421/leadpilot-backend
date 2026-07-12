@@ -65,6 +65,12 @@ class Organization(Base):
     # changes on deploy.
     strict_lead_scoping = Column(Boolean, nullable=False, default=False)
 
+    # Founder-configurable alert thresholds (settings page → Alert Configuration).
+    # JSON blob of {wastage_days, zombie_days, performance_gap, quality_floor};
+    # nullable so existing orgs fall back to the engine's built-in defaults until
+    # they set their own. Read by the insights/leakage engine in dashboard.py.
+    alert_config = Column(JSON, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

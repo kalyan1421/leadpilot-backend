@@ -1072,7 +1072,26 @@ async def get_leads_ageing(
 # Lead wastage — leads with zero calls, aged out
 # ---------------------------------------------------------------------------
 
-def _wasted_leads(db: Session, org_id: str) -> List[Dict[str, Any]]:
+# Built-in alert thresholds — used when an org hasn't set its own alert_config
+# (settings → Alert Configuration). Keys mirror schemas_auth.AlertConfig.
+_ALERT_DEFAULTS = {"wastage_days": 3, "zombie_days": 7, "performance_gap": 15, "quality_floor": 40}
+
+
+def _alert_config(db: Session, org_id: str) -> Dict[str, int]:
+    """Merge an org's saved alert thresholds over the built-in defaults, keeping
+    only sane numeric overrides so a malformed blob can't break the engine."""
+    cfg = dict(_ALERT_DEFAULTS)
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    raw = org.alert_config if org else None
+    if isinstance(raw, dict):
+        for key in _ALERT_DEFAULTS:
+            val = raw.get(key)
+            if isinstance(val, (int, float)) and val >= 0:
+                cfg[key] = int(val)
+    return cfg
+
+
+def _wasted_leads(db: Session, org_id: str, threshold_days: int = 3) -> List[Dict[str, Any]]:
     now = datetime.now(timezone.utc)
 
     called_contact_keys = {
@@ -1092,7 +1111,7 @@ def _wasted_leads(db: Session, org_id: str) -> List[Dict[str, Any]]:
             continue
         created = lead.created_at or now
         days_since_created = (now - created).days
-        if days_since_created >= 3:
+        if days_since_created >= threshold_days:
             wasted.append({
                 "id": lead.id,
                 "name": lead.name or lead.contact_key,
@@ -1110,7 +1129,8 @@ async def get_leads_wastage(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    wasted = _wasted_leads(db, current_user.org_id)
+    cfg = _alert_config(db, current_user.org_id)
+    wasted = _wasted_leads(db, current_user.org_id, cfg["wastage_days"])
     return {"leads": wasted, "total_wasted": len(wasted)}
 
 
@@ -1122,7 +1142,7 @@ _ZOMBIE_EXCLUDED_STAGES = ["New", "Closed Won", "Closed Lost", "Junk"]
 _ZOMBIE_THRESHOLD_DAYS = 7
 
 
-def _zombie_leads(db: Session, org_id: str) -> List[Dict[str, Any]]:
+def _zombie_leads(db: Session, org_id: str, threshold_days: int = _ZOMBIE_THRESHOLD_DAYS) -> List[Dict[str, Any]]:
     now = datetime.now(timezone.utc)
 
     leads = (
@@ -1141,7 +1161,7 @@ def _zombie_leads(db: Session, org_id: str) -> List[Dict[str, Any]]:
         if updated is None:
             continue
         days_stalled = (now - updated).days
-        if days_stalled >= _ZOMBIE_THRESHOLD_DAYS:
+        if days_stalled >= threshold_days:
             zombies.append({
                 "id": lead.id,
                 "name": lead.name or lead.contact_key,
@@ -1159,8 +1179,9 @@ async def get_leads_zombie(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    zombies = _zombie_leads(db, current_user.org_id)
-    return {"leads": zombies, "threshold_days": _ZOMBIE_THRESHOLD_DAYS}
+    cfg = _alert_config(db, current_user.org_id)
+    zombies = _zombie_leads(db, current_user.org_id, cfg["zombie_days"])
+    return {"leads": zombies, "threshold_days": cfg["zombie_days"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1245,30 +1266,31 @@ async def get_telecaller_performance_detail(
 
 def _insights(db: Session, org_id: str) -> List[Dict[str, str]]:
     insights: List[Dict[str, str]] = []
+    cfg = _alert_config(db, org_id)
 
-    wasted = _wasted_leads(db, org_id)
+    wasted = _wasted_leads(db, org_id, cfg["wastage_days"])
     if len(wasted) > 0:
         insights.append({
             "id": uuid.uuid4().hex,
             "category": "wastage",
             "severity": "high" if len(wasted) >= 5 else "medium",
-            "title": f"{len(wasted)} leads have gone untouched for 3+ days",
+            "title": f"{len(wasted)} leads have gone untouched for {cfg['wastage_days']}+ days",
             "description": (
                 f"{len(wasted)} leads are still in New/Assigned with no calls made, "
-                "and have sat for 3 or more days without contact."
+                f"and have sat for {cfg['wastage_days']} or more days without contact."
             ),
         })
 
-    zombies = _zombie_leads(db, org_id)
+    zombies = _zombie_leads(db, org_id, cfg["zombie_days"])
     if len(zombies) > 0:
         insights.append({
             "id": uuid.uuid4().hex,
             "category": "zombie",
             "severity": "high" if len(zombies) >= 5 else "medium",
-            "title": f"{len(zombies)} leads stalled mid-pipeline for a week+",
+            "title": f"{len(zombies)} leads stalled mid-pipeline for {cfg['zombie_days']}+ days",
             "description": (
                 f"{len(zombies)} leads have been sitting in an active pipeline stage "
-                "for 7 or more days without progressing."
+                f"for {cfg['zombie_days']} or more days without progressing."
             ),
         })
 
@@ -1285,7 +1307,7 @@ def _insights(db: Session, org_id: str) -> List[Dict[str, str]]:
         ]
         team_avg_quality = sum(t["quality"] for t in tc_metrics) / len(tc_metrics)
         for t in tc_metrics:
-            if team_avg_quality - t["quality"] > 15:
+            if team_avg_quality - t["quality"] > cfg["performance_gap"]:
                 gap = round(team_avg_quality - t["quality"])
                 insights.append({
                     "id": uuid.uuid4().hex,
@@ -1299,15 +1321,15 @@ def _insights(db: Session, org_id: str) -> List[Dict[str, str]]:
                 })
 
     quality = _lead_quality(db, org_id)
-    if quality["avg_bant_score"] is not None and quality["avg_bant_score"] < 40:
+    if quality["avg_bant_score"] is not None and quality["avg_bant_score"] < cfg["quality_floor"]:
         insights.append({
             "id": uuid.uuid4().hex,
             "category": "quality",
             "severity": "low",
-            "title": "Average lead quality this period is below 40/100",
+            "title": f"Average lead quality this period is below {cfg['quality_floor']}/100",
             "description": (
                 f"The average BANT score across scored leads is {quality['avg_bant_score']}, "
-                "below the healthy threshold of 40."
+                f"below the healthy threshold of {cfg['quality_floor']}."
             ),
         })
 
@@ -1377,8 +1399,9 @@ async def get_report_preview(
 
     if report_type == "weekly_summary":
         data = _snapshot(db, org_id)
-        data["zombie_count"] = len(_zombie_leads(db, org_id))
-        data["wastage_count"] = len(_wasted_leads(db, org_id))
+        cfg = _alert_config(db, org_id)
+        data["zombie_count"] = len(_zombie_leads(db, org_id, cfg["zombie_days"]))
+        data["wastage_count"] = len(_wasted_leads(db, org_id, cfg["wastage_days"]))
     elif report_type == "telecaller_performance":
         data = await _telecaller_performance_payload(db, org_id)
     else:  # lead_quality
