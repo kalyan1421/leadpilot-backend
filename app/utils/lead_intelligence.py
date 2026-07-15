@@ -114,8 +114,13 @@ def lead_card(
     name: Optional[str] = None,
     source: Optional[str] = None,
     lead_status: Optional[str] = None,
+    created_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Everything the inbox card needs for one lead, in one object."""
+    # Most-recent call timestamp across this contact's analyses, so the mobile
+    # inbox can show a real "last contacted N days ago" that actually ages.
+    call_times = [t for t in (_parse_ts(c.get("timestamp")) for c in call_analyses) if t]
+    last_call_at = max(call_times) if call_times else None
     return {
         "contact_key": contact_key,
         "name": name,
@@ -124,6 +129,11 @@ def lead_card(
         "verdict": call_analyses[-1].get("lead_verdict") if call_analyses else None,
         "tags": lead_tags(call_analyses, source=source),
         "total_calls": len(call_analyses),
+        # Timestamps the inbox tile falls back through: last call → lead
+        # creation. Without these every never-called lead defaulted to "now"
+        # on the client, so all cards read the same stale relative time.
+        "last_call_at": last_call_at.isoformat() if last_call_at else None,
+        "created_at": created_at.isoformat() if created_at else None,
     }
 
 

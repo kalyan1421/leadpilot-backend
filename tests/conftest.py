@@ -9,6 +9,22 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
+from app.ratelimit import limiter
+
+
+@pytest.fixture(autouse=True)
+def _disable_rate_limiter():
+    """The rate limiter keeps its counters in a process-wide in-memory store
+    that the single imported `app` shares across every test. Without this,
+    auth tests that each make a few login/register calls accumulate hits under
+    the same test-client IP and start getting 429s once the suite runs
+    together — so they pass in isolation but fail in a full run. Disable the
+    limiter for tests (no test asserts rate-limiting) to keep them isolated.
+    """
+    previously = limiter.enabled
+    limiter.enabled = False
+    yield
+    limiter.enabled = previously
 
 
 @pytest.fixture()

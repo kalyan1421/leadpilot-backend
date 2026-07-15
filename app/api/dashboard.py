@@ -100,6 +100,21 @@ def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
     if stage not in KANBAN_STAGES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"stage must be one of {KANBAN_STAGES}")
 
+    # Pipeline is forward-only: a lead may advance (or drop into the terminal
+    # Closed Lost / Junk stages, which sit last), but never regress to an
+    # earlier stage. Without this guard a lead moved to "Assigned" could be
+    # clicked straight back to "New", silently undoing real progress. A no-op
+    # (same stage) is always allowed. Unknown current stages (legacy rows)
+    # are treated as "before everything" so they can still be classified.
+    current = lead.pipeline_stage
+    current_idx = KANBAN_STAGES.index(current) if current in KANBAN_STAGES else -1
+    new_idx = KANBAN_STAGES.index(stage)
+    if new_idx < current_idx:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"Cannot move a lead backward from '{current}' to '{stage}' — pipeline stages only advance.",
+        )
+
     lead.pipeline_stage = stage
 
     # Revenue tracking: a lead only counts toward the dashboard's revenue chart
