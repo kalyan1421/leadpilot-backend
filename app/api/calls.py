@@ -1782,6 +1782,11 @@ async def get_lead_detail(
             "bant_score": a.get("bant_score"),
             "lead_verdict": a.get("lead_verdict"),
             "analysis_status": a.get("status"),
+            # Who placed/uploaded this call. The mobile app uses this to decide
+            # which backend calls to surface in *its* "My Calls" log — only the
+            # signed-in telecaller's own calls, so merely opening a lead that
+            # has someone else's (or an imported) call never adds a phantom.
+            "telecaller_id": a.get("telecaller_id"),
         }
         for a in reversed(history_analyses)
     ]
