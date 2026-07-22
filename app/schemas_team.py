@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.schemas_auth import Password
+
 
 class TeamMemberResponse(BaseModel):
     id: str
@@ -44,4 +46,4 @@ class SetPasswordRequest(BaseModel):
     original reset behaviour). Provided -> the founder's chosen value is used
     instead, still one-time-displayed and still forces must_reset_password."""
 
-    new_password: Optional[str] = Field(None, min_length=8, max_length=128)
+    new_password: Optional[Password] = None

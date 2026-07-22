@@ -14,24 +14,33 @@ logger = logging.getLogger(__name__)
 
 class LocalStorageManager:
     """Manages local file storage for audio files (drop-in replacement for S3Manager)."""
-    
+
     def __init__(self):
         """Initialize local storage with configured path."""
         self.storage_path = os.path.abspath(settings.local_storage_path)
         self.bucket_name = "local"  # Compatibility with S3Manager references
-        
+
         # Create storage directory if it doesn't exist
         os.makedirs(self.storage_path, exist_ok=True)
         logger.info(f"Local storage initialized at: {self.storage_path}")
-    
+
+    def _call_dir(self, call_id: str) -> str:
+        """Resolve this call's storage directory, refusing to build a path
+        that escapes storage_path — defense in depth against a call_id built
+        from unsanitized input elsewhere (path traversal)."""
+        call_dir = os.path.abspath(os.path.join(self.storage_path, "calls", call_id))
+        if os.path.commonpath([call_dir, self.storage_path]) != self.storage_path:
+            raise ValueError(f"call_id resolves outside storage_path: {call_id!r}")
+        return call_dir
+
     def save_audio_file(self, source_path: str, call_id: str) -> Optional[str]:
         """
         Copy audio file to local storage.
-        
+
         Args:
             source_path: Path to the source audio file
             call_id: Unique identifier for the call
-            
+
         Returns:
             Local storage URL (file path), or None if operation fails
         """
@@ -39,12 +48,12 @@ class LocalStorageManager:
             if not os.path.exists(source_path):
                 logger.error(f"Source audio file not found: {source_path}")
                 return None
-            
+
             # Detect file extension
             file_extension = self._detect_audio_format(source_path)
-            
+
             # Create call directory
-            call_dir = os.path.join(self.storage_path, "calls", call_id)
+            call_dir = self._call_dir(call_id)
             os.makedirs(call_dir, exist_ok=True)
             
             # Copy file
@@ -111,10 +120,14 @@ class LocalStorageManager:
         Returns:
             Filesystem path to the audio file, or None if not found
         """
-        call_dir = os.path.join(self.storage_path, "calls", call_id)
+        try:
+            call_dir = self._call_dir(call_id)
+        except ValueError:
+            logger.error(f"Refusing unsafe call_id in get_audio_file_path: {call_id!r}")
+            return None
         if not os.path.exists(call_dir):
             return None
-        
+
         # Find any audio file in the call directory
         for filename in os.listdir(call_dir):
             if filename.startswith("audio."):

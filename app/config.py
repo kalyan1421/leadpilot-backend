@@ -61,11 +61,22 @@ class Settings(BaseSettings):
     debug: bool = False
     cors_origins: str = "*"  # comma-separated allowed origins; "*" only for local dev
 
+    # How many reverse-proxy hops in front of this app append their own
+    # X-Forwarded-For entry (e.g. 1 for a single Render/Railway-style edge
+    # proxy). Used to find the real client IP for rate-limiting without
+    # trusting a caller-supplied hop further left in the chain.
+    trusted_proxy_hops: int = 1
+
     # Auth — FastAPI is the sole identity provider for web + mobile (no separate NestJS auth).
     # MUST be overridden via .env in any environment beyond a throwaway local sandbox.
     jwt_secret_key: str = _INSECURE_JWT_DEFAULT
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+    # Explicit, narrow opt-out for the weak-secret check below — deliberately
+    # NOT tied to `debug` (that flag is also reused for SQL echo and uvicorn
+    # --reload, so a deploy that sets DEBUG=true for verbose logs would
+    # otherwise silently disable the JWT check too).
+    allow_insecure_jwt_secret: bool = False
 
     class Config:
         env_file = ".env"
@@ -79,15 +90,16 @@ class Settings(BaseSettings):
         HS256 tokens are only as trustworthy as this secret — with the public
         default, anyone can forge a token for any user/org/role (full auth
         bypass + cross-tenant access). Fail loudly at boot instead of running
-        forgeable. Local sandboxes set DEBUG=true to keep the convenient default.
+        forgeable. Local sandboxes set ALLOW_INSECURE_JWT_SECRET=true to keep
+        the convenient default.
         """
-        if self.debug:
+        if self.allow_insecure_jwt_secret:
             return self
         if self.jwt_secret_key == _INSECURE_JWT_DEFAULT or len(self.jwt_secret_key) < 16:
             raise ValueError(
                 "JWT_SECRET_KEY is unset/weak. Set a strong random JWT_SECRET_KEY "
                 "(>=16 chars) in the environment for any non-local deployment, or "
-                "set DEBUG=true for a throwaway local sandbox."
+                "set ALLOW_INSECURE_JWT_SECRET=true for a throwaway local sandbox."
             )
         return self
 

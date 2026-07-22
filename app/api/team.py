@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.api.auth import get_current_user, require_role
+from app.api.auth import require_role
 from app.database import get_db
 from app.models import AudioCall, Lead, LeadAnalysis, User
 from app.utils.lead_intelligence import averaged_debrief_dimensions
@@ -115,7 +115,7 @@ def _to_member_response(user: User, metrics: Dict[str, object]) -> TeamMemberRes
 
 @router.get("", response_model=List[TeamMemberResponse])
 async def list_team(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     members = db.query(User).filter(User.org_id == current_user.org_id).all()
@@ -134,6 +134,8 @@ async def invite_member(
     They don't get a web account; phone is stored as contact info for now."""
     if body.role not in VALID_ROLES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"role must be one of {sorted(VALID_ROLES)}")
+    if body.role == "founder" and current_user.role != "founder":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder can grant the founder role")
     email = body.email.lower()
     existing_by_email = db.query(User).filter(func.lower(User.email) == email).first()
     if existing_by_email is not None:
@@ -183,10 +185,14 @@ async def update_member(
     user = db.query(User).filter(User.id == user_id, User.org_id == current_user.org_id).first()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Team member not found")
+    if user.role == "founder" and current_user.role != "founder" and (body.role is not None or body.is_active is not None):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder can modify a founder's account")
 
     if body.role is not None:
         if body.role not in VALID_ROLES:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"role must be one of {sorted(VALID_ROLES)}")
+        if body.role == "founder" and current_user.role != "founder":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder can grant the founder role")
         user.role = body.role
     if body.is_active is not None:
         if user.id == current_user.id and body.is_active is False:
@@ -216,6 +222,8 @@ async def reset_member_password(
     user = db.query(User).filter(User.id == user_id, User.org_id == current_user.org_id).first()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Team member not found")
+    if user.role == "founder" and current_user.role != "founder":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder can reset a founder's password")
 
     new_password = body.new_password or _generate_temp_password()
     user.hashed_password = hash_password(new_password)

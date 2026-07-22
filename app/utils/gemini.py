@@ -117,9 +117,12 @@ def gemini_extract(messages: List[Dict[str, str]], *, schema: Dict[str, Any],
         with _lock:
             idx = _key_idx % len(keys)
             key = keys[idx]
-        url = f"{settings.gemini_base_url}/models/{mdl}:generateContent?key={key}"
+        # Key goes in a header, not the URL: httpx.HTTPStatusError.__str__ embeds
+        # the full request URL, and callers log that exception message verbatim —
+        # a `?key=...` query param would leak the key into application logs.
+        url = f"{settings.gemini_base_url}/models/{mdl}:generateContent"
         try:
-            r = httpx.post(url, json=body, timeout=_TIMEOUT)
+            r = httpx.post(url, json=body, timeout=_TIMEOUT, headers={"x-goog-api-key": key})
             if r.status_code in (429, 503):  # quota / rate limit / overloaded → rotate
                 last_err = RuntimeError(f"Gemini {r.status_code}: {r.text[:160]}")
                 logger.warning(f"Gemini key #{idx + 1}/{len(keys)} {r.status_code}; rotating")

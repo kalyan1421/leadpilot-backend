@@ -503,6 +503,8 @@ async def update_call(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Call with ID {call_id} not found"
         )
+    if call.telecaller_id != current_user.id and current_user.role not in ("founder", "admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Not authorized to modify this call")
 
     # Update fields if provided
     update_data = call_update.dict(exclude_unset=True)
@@ -547,6 +549,8 @@ async def delete_call(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Call with ID {call_id} not found"
         )
+    if call.telecaller_id != current_user.id and current_user.role not in ("founder", "admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Not authorized to delete this call")
 
     try:
         db.delete(call)
@@ -1040,6 +1044,12 @@ def _gather_contact_calls(contact_key: str, db: Session, org_id: Optional[str] =
     )
     if org_id is not None:
         query = query.filter(AudioCall.org_id == org_id)
+    else:
+        # Fail-safe, not fail-open: an unknown org_id must only ever match
+        # other org-less legacy rows, never skip the filter entirely — doing
+        # that used to merge every org's calls sharing a contact_key into one
+        # memory bubble (a cross-tenant data leak).
+        query = query.filter(AudioCall.org_id.is_(None))
     rows = query.order_by(AudioCall.timestamp.asc()).all()
     out = []
     for c, la in rows:
@@ -1813,16 +1823,26 @@ async def rebuild_precall_brief(
 ):
     """Force-regenerate the pre-call brief for a contact — mirrors
     /api/memory/{contact_key}/rebuild for when a telecaller wants a fresh
-    script without waiting for a new call to land."""
+    script without waiting for a new call to land.
+
+    Per-telecaller scoped the same way as get_lead_detail — without this, any
+    telecaller in the org could rebuild (and read back) another telecaller's
+    brief just by knowing/guessing a contact_key, even with strict_lead_scoping
+    enabled — a cross-telecaller data leak plus an unwanted paid LLM
+    regeneration overwriting the real owner's cached brief.
+    """
     from app.models import Lead, MemoryBubble
     from app.utils.lead_intelligence import lead_card
 
     org_id = current_user.org_id
+    scoped = bool(current_user.organization.strict_lead_scoping) and current_user.role == "telecaller"
     lead_row = (
         db.query(Lead)
         .filter(Lead.contact_key == contact_key, Lead.org_id == org_id)
         .first()
     )
+    if scoped and lead_row and lead_row.assigned_to != current_user.id:
+        raise HTTPException(status_code=404, detail=f"No lead or calls for contact {contact_key}")
     bubble_row = (
         db.query(MemoryBubble)
         .filter(MemoryBubble.contact_key == contact_key, MemoryBubble.org_id == org_id)
@@ -1833,6 +1853,7 @@ async def rebuild_precall_brief(
 
     history_analyses = _all_analyses_by_contact(
         db, org_id, include_statuses=("completed", "not_relevant"),
+        telecaller_id=current_user.id if scoped else None,
     ).get(contact_key, [])
     display_name = (lead_row.name if lead_row else None) or contact_key.replace("_", " ").title()
     intent_bucket = lead_card(contact_key, history_analyses, name=display_name).get("intent_bucket")
@@ -2213,7 +2234,12 @@ async def upload_recording(
     # and same-name collisions); only when neither exists do we fall back to a name
     # slug. This is what lets an auto-captured call that now sends `phone` group
     # correctly with the lead's other calls and its memory bubble.
-    slug = (contact_key_override or "").strip() or normalize_phone(phone) or slugify_contact(name or "lead")
+    # contact_key_override is client-supplied and flows straight into call_id,
+    # which local storage later uses as a filesystem path component — strip
+    # anything but safe identifier characters so a value like "../../etc" can't
+    # escape the intended storage directory (path traversal).
+    safe_override = re.sub(r"[^a-zA-Z0-9_-]", "", (contact_key_override or "").strip())
+    slug = safe_override or normalize_phone(phone) or slugify_contact(name or "lead")
     call_id = f"call_{slug}_{_uuid.uuid4().hex[:8]}"
 
     # Upsert a Lead row so this contact shows in the inbox with its details.
@@ -2327,6 +2353,8 @@ async def get_telecaller_score(
     """
     from app.utils.lead_intelligence import telecaller_score
 
+    if scope == "team" and current_user.role not in ("founder", "admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder/admin can view team-wide scope")
     window_days = max(1, window_days)  # 0/negative would silently mean "all time"
     telecaller_id = None if scope == "team" else current_user.id
     grouped = _all_analyses_by_contact(db, current_user.org_id, telecaller_id=telecaller_id)
@@ -2337,15 +2365,20 @@ async def get_telecaller_score(
 
 
 @intel_router.post("/translate", status_code=status.HTTP_200_OK)
-async def translate_texts(payload: Dict[str, Any]):
+async def translate_texts(payload: Dict[str, Any], current_user=Depends(_get_current_user)):
     """
     Translate a batch of UI strings → powers the Score / AI-Summary "View English" toggle.
     Body: {"texts": ["...", ...], "target": "en"}. Returns {"texts": [...]} index-aligned.
+
+    Auth required — this fans out to the paid Sarvam translation API, so an
+    unauthenticated version of this endpoint was an open cost-abuse/DoS vector.
     """
     from app.utils.translation import translate_strings
     texts = payload.get("texts") or []
     target = payload.get("target") or "en"
     if not isinstance(texts, list) or not texts:
         return {"texts": []}
+    if len(texts) > 200:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Too many texts in one request (max 200)")
     translated = await asyncio.to_thread(translate_strings, [str(t) for t in texts], target)
     return {"texts": translated}

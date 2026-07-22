@@ -33,10 +33,15 @@ class AudioCallResponse(BaseModel):
 
 
 class AudioCallUpdate(BaseModel):
-    """Schema for updating an audio call."""
+    """Schema for updating an audio call.
+
+    audio_file_url is deliberately NOT editable here — it's set once by the
+    upload/processing pipeline. Letting a client repoint it let download_audio
+    open an arbitrary local path (path traversal) or fetch an arbitrary URL
+    server-side via the S3 fallback (SSRF).
+    """
 
     transcript: Optional[Dict[str, Any]] = None
-    audio_file_url: Optional[str] = None
     processed_data: Optional[Dict[str, Any]] = None
     timestamp: Optional[datetime] = None
 

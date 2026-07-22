@@ -115,11 +115,16 @@ def test_telecaller_score_defaults_to_own_calls_only(client, db_session):
 
     me = client.get("/api/telecaller/score",
                     headers={"Authorization": f"Bearer {tok_a}"}).json()
+    team_as_telecaller = client.get("/api/telecaller/score?scope=team",
+                                    headers={"Authorization": f"Bearer {tok_a}"})
     team = client.get("/api/telecaller/score?scope=team",
-                      headers={"Authorization": f"Bearer {tok_a}"}).json()
+                      headers={"Authorization": f"Bearer {ftoken}"}).json()
 
-    # "me" reflects only Ava's call count; "team" sees both telecallers' calls.
+    # "me" reflects only Ava's call count. scope=team is founder/admin-only
+    # (a telecaller could otherwise pull the org-wide aggregate) — 403 for
+    # Ava, while the founder sees both telecallers' calls.
     assert me["calls"] == 1, me
+    assert team_as_telecaller.status_code == 403, team_as_telecaller.text
     assert team["calls"] == 2, team
 
 

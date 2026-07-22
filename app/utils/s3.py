@@ -27,7 +27,73 @@ class S3Manager:
             region_name=settings.aws_region
         )
         self.bucket_name = settings.s3_bucket_name
-    
+
+    def save_audio_file(self, source_path: str, call_id: str) -> Optional[str]:
+        """
+        Upload a local file to S3 under this call's key — mirrors
+        LocalStorageManager/SupabaseStorageManager.save_audio_file so
+        upload_recording can treat all three storage backends identically.
+
+        Args:
+            source_path: Path to the local audio file to upload
+            call_id: Unique identifier for the call (used in the S3 key)
+
+        Returns:
+            The S3 URL of the uploaded object, or None if the upload fails.
+        """
+        try:
+            file_extension = self._detect_audio_format_from_headers(source_path)
+            s3_key = f"calls/{call_id}/audio.{file_extension}"
+            content_type = self._get_content_type(file_extension)
+            with open(source_path, 'rb') as file_obj:
+                self.s3_client.upload_fileobj(
+                    file_obj,
+                    self.bucket_name,
+                    s3_key,
+                    ExtraArgs={
+                        'ContentType': content_type,
+                        'ServerSideEncryption': 'AES256',
+                        'Metadata': {
+                            'call_id': call_id,
+                            'uploaded_at': str(datetime.now()),
+                        },
+                    },
+                )
+            s3_url = f"https://{self.bucket_name}.s3.amazonaws.com/{s3_key}"
+            logger.info(f"Saved audio for call {call_id} to S3: {s3_url}")
+            return s3_url
+        except (ClientError, NoCredentialsError, OSError) as e:
+            logger.error(f"Error saving audio file for call {call_id}: {e}")
+            return None
+
+    def get_audio_file_path(self, call_id: str) -> Optional[str]:
+        """
+        Download this call's audio object to a local temp file and return its
+        path — the transcription pipeline needs a local file to read, so this
+        mirrors SupabaseStorageManager.get_audio_file_path. Caller owns
+        cleanup of the returned temp file (same contract as that method).
+
+        Args:
+            call_id: Unique identifier for the call
+
+        Returns:
+            Local filesystem path to the downloaded audio, or None if no
+            audio object exists for this call.
+        """
+        for ext in ('mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac'):
+            s3_key = f"calls/{call_id}/audio.{ext}"
+            try:
+                response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
+            except ClientError as e:
+                if e.response.get('Error', {}).get('Code') in ('404', 'NoSuchKey'):
+                    continue
+                logger.error(f"Error fetching audio for call {call_id}: {e}")
+                return None
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp:
+                tmp.write(response['Body'].read())
+                return tmp.name
+        return None
+
     def download_and_upload_audio(self, audio_url: str, call_id: str, file_extension: str = None) -> Optional[tuple[str, str]]:
         """
         Download audio file from external URL and upload to S3.
@@ -38,7 +104,10 @@ class S3Manager:
             file_extension: File extension for the audio file (if None, will be detected from URL or file headers)
             
         Returns:
-            Tuple of (S3 URL, detected file extension), or None if operation fails
+            The S3 URL (a plain str, despite the Optional[tuple[str, str]] hint
+            above — kept for signature parity with older callers; every actual
+            caller in this codebase already treats the return as a bare str),
+            or None if operation fails.
         """
         try:
             logger.info(f"Downloading audio from {audio_url} for call {call_id}")
@@ -89,6 +158,7 @@ class S3Manager:
                         s3_key,
                         ExtraArgs={
                             'ContentType': content_type,
+                            'ServerSideEncryption': 'AES256',
                             'Metadata': {
                                 'call_id': call_id,
                                 'source_url': audio_url,
@@ -312,17 +382,19 @@ def get_storage_manager():
         return S3Manager()
 
 
-# Global S3 manager instance - safe initialization
-try:
-    if settings.storage_mode == "local":
-        from app.utils.local_storage import LocalStorageManager
-        s3_manager = LocalStorageManager()
-    elif settings.storage_mode == "supabase":
-        from app.utils.supabase_storage import SupabaseStorageManager
-        s3_manager = SupabaseStorageManager()
-    else:
-        s3_manager = S3Manager()
-except Exception as e:
-    logger.warning(f"Failed to initialize storage manager: {e}. Using local storage fallback.")
+# Global S3 manager instance
+#
+# Deliberately NOT caught-and-fallen-back-to-local on failure: a misconfigured
+# S3/Supabase backend (bad credentials, missing bucket, etc.) used to silently
+# swap in LocalStorageManager with only a WARNING log — every recording would
+# then be written to the container's ephemeral disk and permanently lost on
+# the next restart/redeploy. Fail loudly at import time instead, the same way
+# app/main.py already refuses to start on a DB init failure.
+if settings.storage_mode == "local":
     from app.utils.local_storage import LocalStorageManager
     s3_manager = LocalStorageManager()
+elif settings.storage_mode == "supabase":
+    from app.utils.supabase_storage import SupabaseStorageManager
+    s3_manager = SupabaseStorageManager()
+else:
+    s3_manager = S3Manager()

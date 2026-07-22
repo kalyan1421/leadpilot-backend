@@ -3,6 +3,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
@@ -112,6 +113,23 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "service": "Voice Summary API"}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    """Same response shape as FastAPI's default handler, but scrubs the raw
+    submitted value for any field whose name mentions "password". Pydantic v2
+    error dicts include an "input" key by default — for a too-short or
+    too-long password on register/change-password/reset-password, that
+    default behavior echoed the user's plaintext password back in the 422
+    response body."""
+    errors = []
+    for err in exc.errors():
+        err = dict(err)
+        if any("password" in str(part).lower() for part in err.get("loc", ())):
+            err.pop("input", None)
+        errors.append(err)
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.exception_handler(Exception)

@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, require_role
 from app.database import get_db
 from app.models import Attendance, AudioCall, Lead, LeadAnalysis, Organization, User
 from app.utils.lead_intelligence import DEBRIEF_DIMENSIONS, averaged_debrief_dimensions, mmss_to_seconds
@@ -332,7 +332,7 @@ def _telecaller_metrics_batch(db: Session, telecaller_ids: List[str], org_id: st
 
 @router.get("/telecallers/performance", status_code=status.HTTP_200_OK)
 async def get_telecaller_performance(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     telecallers = (
@@ -403,7 +403,7 @@ def _telecaller_status(
 
 @router.get("/telecallers/status", status_code=status.HTTP_200_OK)
 async def get_team_status(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """Team Health board — one row per telecaller with a derived
@@ -507,7 +507,7 @@ _COACHING_MIN_CALLS = 3  # below this, a low average isn't a confident signal
 
 @router.get("/coaching/queue", status_code=status.HTTP_200_OK)
 async def get_coaching_queue(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """
@@ -752,7 +752,7 @@ def _prev_month_bounds(month_start: datetime) -> tuple:
 @router.get("/dashboard/revenue", status_code=status.HTTP_200_OK)
 async def get_dashboard_revenue(
     range_days: int = Query(30, alias="range"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     if range_days not in _VALID_REVENUE_RANGE_DAYS:
@@ -837,7 +837,7 @@ async def get_dashboard_revenue(
 
 @router.get("/dashboard/goal", status_code=status.HTTP_200_OK)
 async def get_dashboard_goal(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     org = db.query(Organization).filter(Organization.id == current_user.org_id).first()
@@ -1244,7 +1244,7 @@ async def get_leads_zombie(
 @router.get("/telecallers/performance/{telecaller_id}", status_code=status.HTTP_200_OK)
 async def get_telecaller_performance_detail(
     telecaller_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     telecaller = (
@@ -1391,7 +1391,7 @@ def _insights(db: Session, org_id: str) -> List[Dict[str, str]]:
 
 @router.get("/insights", status_code=status.HTTP_200_OK)
 async def get_insights(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     return {"insights": _insights(db, current_user.org_id)}
@@ -1439,7 +1439,7 @@ async def _telecaller_performance_payload(db: Session, org_id: str) -> Dict[str,
 @router.get("/reports/preview", status_code=status.HTTP_200_OK)
 async def get_report_preview(
     report_type: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     if report_type not in _REPORT_TYPES:
