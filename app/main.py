@@ -12,6 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from app.ratelimit import limiter
 from app.api.attendance import router as attendance_router
 from app.api.auth import router as auth_router
+from app.api.call_log import router as call_log_router
 from app.api.calls import router as calls_router
 from app.api.calls import intel_router
 from app.api.dashboard import router as dashboard_router
@@ -67,6 +68,7 @@ app.include_router(intel_router)
 app.include_router(team_router)
 app.include_router(attendance_router)
 app.include_router(follow_ups_router)
+app.include_router(call_log_router)
 
 
 @app.on_event("startup")

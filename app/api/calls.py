@@ -1445,8 +1445,8 @@ async def get_inbox(
     for L in leads:
         analyses = grouped.get(L.contact_key, [])
         by_key[L.contact_key] = lead_card(
-            L.contact_key, analyses, name=L.name, source=L.source, lead_status=L.status,
-            created_at=L.created_at,
+            L.contact_key, analyses, name=L.name, phone=L.phone, source=L.source,
+            lead_status=L.status, created_at=L.created_at,
         )
     # 2. Calls that have no Lead row (legacy / imported demo data).
     for key, analyses in grouped.items():

@@ -112,6 +112,7 @@ def lead_card(
     call_analyses: List[Dict[str, Any]],
     *,
     name: Optional[str] = None,
+    phone: Optional[str] = None,
     source: Optional[str] = None,
     lead_status: Optional[str] = None,
     created_at: Optional[datetime] = None,
@@ -124,6 +125,10 @@ def lead_card(
     return {
         "contact_key": contact_key,
         "name": name,
+        # Was missing entirely — the mobile inbox list read `phone` off this
+        # card (not the lead-detail response) and always got '', so every
+        # never-opened lead showed a blank phone number until you tapped in.
+        "phone": phone,
         "lead_score": lead_score_from_calls(call_analyses),
         "intent_bucket": intent_bucket(call_analyses, lead_status=lead_status),
         "verdict": call_analyses[-1].get("lead_verdict") if call_analyses else None,

@@ -366,3 +366,47 @@ class FollowUp(Base):
         return f"<FollowUp(id='{self.id}', due_at='{self.due_at}')>"
 
 
+class CallLog(Base):
+    """One entry per raw phone call from the telecaller's device call log —
+    every inbound/outbound/missed call, synced from the phone's native dialer
+    history, not just calls placed through this app's own Call button.
+
+    Deliberately separate from AudioCall: most call-log entries never get a
+    recording or AI analysis (personal calls, missed calls, calls to numbers
+    that aren't leads yet) — AudioCall models "a call that was recorded and
+    analyzed", this models "a call that happened", and `audio_call_id` links
+    the two when both exist for the same call.
+    """
+
+    __tablename__ = "call_logs"
+
+    id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
+    telecaller_id = Column(String(255), ForeignKey("users.id"), nullable=False, index=True)
+    phone = Column(String(40), nullable=False, index=True)
+    # "inbound" | "outbound" | "missed" — missed is its own bucket (an unanswered
+    # inbound call) since a 0-duration "call" reads very differently from one
+    # that connected.
+    direction = Column(String(20), nullable=False)
+    duration_seconds = Column(Integer, nullable=False, default=0)
+    called_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    # The device-native call-log row id (Android CallLog.Calls._ID), scoped per
+    # telecaller — lets a re-sync (app relaunch, retry) upsert idempotently
+    # instead of duplicating the same call. Nullable so a manually-created
+    # entry (no device source) is still representable.
+    device_call_id = Column(String(128), nullable=True, index=True)
+    audio_call_id = Column(String(255), ForeignKey("audio_calls.call_id"), nullable=True, index=True)
+    lead_id = Column(String(255), ForeignKey("leads.id"), nullable=True, index=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "telecaller_id", "device_call_id", name="uq_call_logs_telecaller_device_call"
+        ),
+    )
+
+    def __repr__(self):
+        return f"<CallLog(id='{self.id}', phone='{self.phone}', direction='{self.direction}')>"
+
+
