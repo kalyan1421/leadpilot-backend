@@ -410,3 +410,25 @@ class CallLog(Base):
         return f"<CallLog(id='{self.id}', phone='{self.phone}', direction='{self.direction}')>"
 
 
+class LeadStageChange(Base):
+    """Audit trail for every pipeline-stage move — logged for forward moves
+    too (note optional there), but a backward move (see
+    dashboard._apply_stage_update) is rejected unless it carries a note, so
+    'why was this lead reopened / moved back' is always answerable here."""
+
+    __tablename__ = "lead_stage_changes"
+
+    id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
+    lead_id = Column(String(255), ForeignKey("leads.id"), nullable=False, index=True)
+    telecaller_id = Column(String(255), ForeignKey("users.id"), nullable=True, index=True)
+    from_stage = Column(String(50), nullable=False)
+    to_stage = Column(String(50), nullable=False)
+    note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<LeadStageChange(lead_id='{self.lead_id}', {self.from_stage!r}->{self.to_stage!r})>"
+
+

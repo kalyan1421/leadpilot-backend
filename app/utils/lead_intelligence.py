@@ -293,6 +293,22 @@ def _seconds_to_mmss(sec: float) -> str:
     return f"{sec // 60}:{sec % 60:02d}"
 
 
+def _avg_sentiment(
+    sentiment_arc: Optional[List[Dict[str, Any]]], *, prospect_role: str = "USER"
+) -> Optional[float]:
+    """Average raw (-1..1) sentiment across a call's turns, preferring the
+    PROSPECT's turns (how the lead felt) and falling back to all turns when
+    roles aren't present. None when there's no sentiment signal at all.
+    Shared by sentiment_score() (0-100 ring) and call_sentiment_label()
+    (positive/neutral/negative) so the two never disagree on which turns
+    count."""
+    arc = sentiment_arc or []
+    prospect = [t.get("score") for t in arc
+                if (t.get("role") or "").upper() == prospect_role and isinstance(t.get("score"), (int, float))]
+    pool = prospect or [t.get("score") for t in arc if isinstance(t.get("score"), (int, float))]
+    return sum(pool) / len(pool) if pool else None
+
+
 def sentiment_score(sentiment_arc: Optional[List[Dict[str, Any]]], *, prospect_role: str = "USER") -> int:
     """
     Single 0-100 sentiment ring for one call (the 'Sentiment 63' card).
@@ -300,13 +316,30 @@ def sentiment_score(sentiment_arc: Optional[List[Dict[str, Any]]], *, prospect_r
     Prefers the PROSPECT's turns (how the lead felt). Falls back to all turns
     when roles aren't present. Returns 0 when there is no sentiment signal.
     """
-    arc = sentiment_arc or []
-    prospect = [t.get("score") for t in arc
-                if (t.get("role") or "").upper() == prospect_role and isinstance(t.get("score"), (int, float))]
-    pool = prospect or [t.get("score") for t in arc if isinstance(t.get("score"), (int, float))]
-    if not pool:
-        return 0
-    return _to_0_100(sum(pool) / len(pool))
+    avg = _avg_sentiment(sentiment_arc, prospect_role=prospect_role)
+    return _to_0_100(avg) if avg is not None else 0
+
+
+# Whole-call positive/neutral/negative — the same 3-value vocabulary as
+# lead_analyzer.py's per-turn fallback label (_norm_arc), applied here to a
+# call's *average* sentiment (see _avg_sentiment) rather than one turn.
+# Thresholds match that same fallback (>0.1 positive, <-0.1 negative) so the
+# two readings of "positive" agree. This is what the mobile app's "Positive
+# Calls" inbox stat counts — it used to proxy off the composite call score
+# (>= 60), which conflated "the rep executed well" with "the prospect seemed
+# happy"; this is the real signal. None (not "neutral") when the call has no
+# sentiment data at all, so an un-analyzed call is never miscounted either way.
+def call_sentiment_label(
+    sentiment_arc: Optional[List[Dict[str, Any]]], *, prospect_role: str = "USER"
+) -> Optional[str]:
+    avg = _avg_sentiment(sentiment_arc, prospect_role=prospect_role)
+    if avg is None:
+        return None
+    if avg > 0.1:
+        return "positive"
+    if avg < -0.1:
+        return "negative"
+    return "neutral"
 
 
 def sentiment_timeline(

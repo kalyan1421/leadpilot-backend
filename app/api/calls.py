@@ -1333,7 +1333,7 @@ def _all_analyses_by_contact(
     """
     from app.models import LeadAnalysis
     from app.utils.memory_bubble import contact_key_from_call_id
-    from app.utils.lead_intelligence import sentiment_score
+    from app.utils.lead_intelligence import call_sentiment_label, sentiment_score
 
     query = (
         db.query(LeadAnalysis, AudioCall)
@@ -1366,6 +1366,7 @@ def _all_analyses_by_contact(
             "next_action": la.next_action,
             "agent_total_score": (la.agent_debrief or {}).get("total_score") if la.agent_debrief else None,
             "sentiment_score": sentiment_score(la.sentiment_arc or []),  # for the per-call trend
+            "sentiment_label": call_sentiment_label(la.sentiment_arc or []),  # positive/neutral/negative/None
         })
     return grouped
 
@@ -1792,6 +1793,10 @@ async def get_lead_detail(
             "bant_score": a.get("bant_score"),
             "lead_verdict": a.get("lead_verdict"),
             "analysis_status": a.get("status"),
+            # Real per-call sentiment (positive/neutral/negative), not a score
+            # proxy — see call_sentiment_label. None for a call with no
+            # sentiment signal yet (not yet analyzed, or analysis failed).
+            "sentiment": a.get("sentiment_label"),
             # Who placed/uploaded this call. The mobile app uses this to decide
             # which backend calls to surface in *its* "My Calls" log — only the
             # signed-in telecaller's own calls, so merely opening a lead that

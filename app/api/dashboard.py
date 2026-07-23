@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
-from app.models import Attendance, AudioCall, Lead, LeadAnalysis, Organization, User
+from app.models import Attendance, AudioCall, Lead, LeadAnalysis, LeadStageChange, Organization, User
 from app.utils.lead_intelligence import DEBRIEF_DIMENSIONS, averaged_debrief_dimensions, mmss_to_seconds
 from app.utils.memory_bubble import contact_key_from_call_id
 
@@ -100,20 +100,30 @@ def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
     if stage not in KANBAN_STAGES:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"stage must be one of {KANBAN_STAGES}")
 
-    # Pipeline is forward-only: a lead may advance (or drop into the terminal
-    # Closed Lost / Junk stages, which sit last), but never regress to an
-    # earlier stage. Without this guard a lead moved to "Assigned" could be
-    # clicked straight back to "New", silently undoing real progress. A no-op
+    # Pipeline defaults to forward-only: a lead may advance (or drop into the
+    # terminal Closed Lost / Junk stages, which sit last) without any extra
+    # justification — without SOME guard here, a lead moved to "Assigned"
+    # could be clicked straight back to "New", silently undoing real progress
+    # with no record of why. A backward move (including reopening a Closed
+    # Won/Lost/Junk lead) is still allowed, but only with a non-empty `note`
+    # explaining why — the caller (see both endpoints below) persists that
+    # note to LeadStageChange regardless of direction, so every move is
+    # auditable, but only a backward one is gated on having a reason. A no-op
     # (same stage) is always allowed. Unknown current stages (legacy rows)
     # are treated as "before everything" so they can still be classified.
     current = lead.pipeline_stage
     current_idx = KANBAN_STAGES.index(current) if current in KANBAN_STAGES else -1
     new_idx = KANBAN_STAGES.index(stage)
     if new_idx < current_idx:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail=f"Cannot move a lead backward from '{current}' to '{stage}' — pipeline stages only advance.",
-        )
+        note = (body.get("note") or "").strip()
+        if not note:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Moving a lead backward from '{current}' to '{stage}' requires "
+                    "a non-empty 'note' explaining why."
+                ),
+            )
 
     lead.pipeline_stage = stage
 
@@ -140,6 +150,31 @@ def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
     return lead
 
 
+def _log_stage_change(
+    db: Session,
+    lead: Lead,
+    current_user: User,
+    previous_stage: str,
+    note: Optional[str],
+) -> None:
+    """Records every actual stage transition (skips true no-ops) so the
+    pipeline has a full audit trail — not just the backward moves that
+    require a note, though those are the ones where it matters most."""
+    if previous_stage == lead.pipeline_stage:
+        return
+    db.add(
+        LeadStageChange(
+            id=str(uuid.uuid4()),
+            org_id=current_user.org_id,
+            lead_id=lead.id,
+            telecaller_id=current_user.id,
+            from_stage=previous_stage,
+            to_stage=lead.pipeline_stage,
+            note=(note or "").strip() or None,
+        )
+    )
+
+
 @router.patch("/leads/{lead_id}/stage", status_code=status.HTTP_200_OK)
 async def update_lead_stage(
     lead_id: str,
@@ -151,7 +186,9 @@ async def update_lead_stage(
     if lead is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
 
+    previous_stage = lead.pipeline_stage
     lead = _apply_stage_update(lead, body)
+    _log_stage_change(db, lead, current_user, previous_stage, body.get("note"))
     db.commit()
     return {
         "id": lead.id,
@@ -181,7 +218,9 @@ async def update_lead_stage_by_contact(
     if lead is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
 
+    previous_stage = lead.pipeline_stage
     lead = _apply_stage_update(lead, body)
+    _log_stage_change(db, lead, current_user, previous_stage, body.get("note"))
     db.commit()
     return {
         "contact_key": lead.contact_key,
@@ -200,6 +239,7 @@ def _compute_telecaller_metrics(
     calls: List[AudioCall],
     analyses: Dict[str, LeadAnalysis],
     assigned_leads: List[Lead],
+    compute_trend: bool = True,
 ) -> Dict[str, Any]:
     """Pure aggregation over already-fetched rows for one telecaller — split out
     from `_telecaller_metrics` so `_telecaller_metrics_batch` can pre-fetch all
@@ -235,26 +275,30 @@ def _compute_telecaller_metrics(
                 talk_times.append(secs)
     talk_time_seconds = round(sum(talk_times) / len(talk_times)) if talk_times else 0
 
-    now = datetime.now(timezone.utc)
-    cur_start, prev_start = now - timedelta(days=14), now - timedelta(days=28)
-    cur_scores, prev_scores = [], []
-    for c in calls:
-        a = analyses.get(c.call_id)
-        if not a or not isinstance(a.agent_debrief, dict):
-            continue
-        ts = c.timestamp
-        if ts is None:
-            continue
-        total = a.agent_debrief.get("total_score")
-        if not isinstance(total, (int, float)):
-            continue
-        if ts >= cur_start:
-            cur_scores.append(total)
-        elif prev_start <= ts < cur_start:
-            prev_scores.append(total)
+    # The trailing-14-vs-previous-14-day trend is relative to *now*, not to any
+    # caller-supplied date range — comparing it against an arbitrary custom
+    # range would be misleading, so range-scoped callers skip it (trend=None).
     trend = None
-    if cur_scores and prev_scores:
-        trend = "up" if (sum(cur_scores) / len(cur_scores)) >= (sum(prev_scores) / len(prev_scores)) else "down"
+    if compute_trend:
+        now = datetime.now(timezone.utc)
+        cur_start, prev_start = now - timedelta(days=14), now - timedelta(days=28)
+        cur_scores, prev_scores = [], []
+        for c in calls:
+            a = analyses.get(c.call_id)
+            if not a or not isinstance(a.agent_debrief, dict):
+                continue
+            ts = c.timestamp
+            if ts is None:
+                continue
+            total = a.agent_debrief.get("total_score")
+            if not isinstance(total, (int, float)):
+                continue
+            if ts >= cur_start:
+                cur_scores.append(total)
+            elif prev_start <= ts < cur_start:
+                prev_scores.append(total)
+        if cur_scores and prev_scores:
+            trend = "up" if (sum(cur_scores) / len(cur_scores)) >= (sum(prev_scores) / len(prev_scores)) else "down"
 
     return {
         "calls": total_calls,
@@ -271,50 +315,83 @@ def _compute_telecaller_metrics(
     }
 
 
-def _telecaller_metrics(db: Session, telecaller_id: str, org_id: str) -> Dict[str, Any]:
+def _telecaller_metrics(
+    db: Session,
+    telecaller_id: str,
+    org_id: str,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> Dict[str, Any]:
     """Single-telecaller path — used by the detail endpoint, where one telecaller's
     worth of queries is the right cost. Bulk callers should use the _batch variant
-    below instead of calling this in a loop."""
-    calls = (
-        db.query(AudioCall)
-        .filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == org_id)
-        .all()
-    )
-    analyses = {
-        a.call_id: a
-        for a in db.query(LeadAnalysis)
+    below instead of calling this in a loop.
+
+    `start`/`end` (UTC, end exclusive) optionally scope the CALL-derived figures
+    (calls, connect/positive %, quality, talk time) to that window, same as the
+    dashboard snapshot convention — lead-derived figures (close %, revenue) stay
+    current-state/all-time regardless, since a lead's assignment and its close
+    can straddle any window and there's no non-arbitrary way to range-scope that
+    ratio."""
+    calls_query = db.query(AudioCall).filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == org_id)
+    if start is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp >= start)
+    if end is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp < end)
+    calls = calls_query.all()
+
+    analyses_query = (
+        db.query(LeadAnalysis)
         .join(AudioCall, AudioCall.call_id == LeadAnalysis.call_id)
         .filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == org_id,
                 LeadAnalysis.status == "completed")
-        .all()
-    }
+    )
+    if start is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp >= start)
+    if end is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp < end)
+    analyses = {a.call_id: a for a in analyses_query.all()}
+
     assigned_leads = db.query(Lead).filter(Lead.assigned_to == telecaller_id, Lead.org_id == org_id).all()
-    return _compute_telecaller_metrics(calls, analyses, assigned_leads)
+    return _compute_telecaller_metrics(calls, analyses, assigned_leads, compute_trend=start is None and end is None)
 
 
-def _telecaller_metrics_batch(db: Session, telecaller_ids: List[str], org_id: str) -> Dict[str, Dict[str, Any]]:
+def _telecaller_metrics_batch(
+    db: Session,
+    telecaller_ids: List[str],
+    org_id: str,
+    start: Optional[datetime] = None,
+    end: Optional[datetime] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Same aggregation as `_telecaller_metrics`, but for many telecallers in 3
     queries total instead of 3 queries per telecaller — `get_telecaller_performance`,
-    `_insights`, and the report-preview endpoint were all doing that N+1 in a loop."""
+    `_insights`, and the report-preview endpoint were all doing that N+1 in a loop.
+
+    `start`/`end`: see `_telecaller_metrics` — only `get_telecaller_performance`
+    (the Performance List page) passes these; every other caller omits them and
+    gets the exact same all-time behavior as before."""
     if not telecaller_ids:
         return {}
 
+    calls_query = db.query(AudioCall).filter(AudioCall.telecaller_id.in_(telecaller_ids), AudioCall.org_id == org_id)
+    if start is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp >= start)
+    if end is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp < end)
     calls_by_tc: Dict[str, List[AudioCall]] = {tid: [] for tid in telecaller_ids}
-    for call in (
-        db.query(AudioCall)
-        .filter(AudioCall.telecaller_id.in_(telecaller_ids), AudioCall.org_id == org_id)
-        .all()
-    ):
+    for call in calls_query.all():
         calls_by_tc[call.telecaller_id].append(call)
 
-    analyses_by_call_id = {
-        a.call_id: a
-        for a in db.query(LeadAnalysis)
+    analyses_query = (
+        db.query(LeadAnalysis)
         .join(AudioCall, AudioCall.call_id == LeadAnalysis.call_id)
         .filter(AudioCall.telecaller_id.in_(telecaller_ids), AudioCall.org_id == org_id,
                 LeadAnalysis.status == "completed")
-        .all()
-    }
+    )
+    if start is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp >= start)
+    if end is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp < end)
+    analyses_by_call_id = {a.call_id: a for a in analyses_query.all()}
 
     leads_by_tc: Dict[str, List[Lead]] = {tid: [] for tid in telecaller_ids}
     for lead in (
@@ -324,24 +401,36 @@ def _telecaller_metrics_batch(db: Session, telecaller_ids: List[str], org_id: st
     ):
         leads_by_tc[lead.assigned_to].append(lead)
 
+    compute_trend = start is None and end is None
     return {
-        tid: _compute_telecaller_metrics(calls_by_tc[tid], analyses_by_call_id, leads_by_tc[tid])
+        tid: _compute_telecaller_metrics(calls_by_tc[tid], analyses_by_call_id, leads_by_tc[tid], compute_trend=compute_trend)
         for tid in telecaller_ids
     }
 
 
 @router.get("/telecallers/performance", status_code=status.HTTP_200_OK)
 async def get_telecaller_performance(
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
+    """`start`/`end` (YYYY-MM-DD, inclusive) scope the call-derived figures to
+    that window, same convention as /dashboard/snapshot; omit both for all-time."""
+    s = _parse_snapshot_date(start, field="start")
+    e = _parse_snapshot_date(end, field="end")
+    if e is not None:
+        e = e + timedelta(days=1)  # inclusive end date -> exclusive next-day bound
+    if s is not None and e is not None and e <= s:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="end must be on or after start")
+
     telecallers = (
         db.query(User)
         .filter(User.org_id == current_user.org_id, User.role == "telecaller")
         .all()
     )
 
-    metrics_by_tc = _telecaller_metrics_batch(db, [tc.id for tc in telecallers], current_user.org_id)
+    metrics_by_tc = _telecaller_metrics_batch(db, [tc.id for tc in telecallers], current_user.org_id, start=s, end=e)
     results: List[Dict[str, Any]] = [
         {"id": tc.id, "name": tc.name, **metrics_by_tc[tc.id]} for tc in telecallers
     ]
@@ -1244,9 +1333,21 @@ async def get_leads_zombie(
 @router.get("/telecallers/performance/{telecaller_id}", status_code=status.HTTP_200_OK)
 async def get_telecaller_performance_detail(
     telecaller_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
+    """`start`/`end` (YYYY-MM-DD, inclusive) scope calls, best/needs-review, and
+    the timeline to that window, same convention as /dashboard/snapshot; omit
+    both for all-time (the historical default)."""
+    s = _parse_snapshot_date(start, field="start")
+    e = _parse_snapshot_date(end, field="end")
+    if e is not None:
+        e = e + timedelta(days=1)  # inclusive end date -> exclusive next-day bound
+    if s is not None and e is not None and e <= s:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="end must be on or after start")
+
     telecaller = (
         db.query(User)
         .filter(User.id == telecaller_id, User.org_id == current_user.org_id, User.role == "telecaller")
@@ -1255,21 +1356,26 @@ async def get_telecaller_performance_detail(
     if telecaller is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Telecaller not found")
 
-    metrics = _telecaller_metrics(db, telecaller_id, current_user.org_id)
+    metrics = _telecaller_metrics(db, telecaller_id, current_user.org_id, start=s, end=e)
 
-    calls = (
-        db.query(AudioCall)
-        .filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == current_user.org_id)
-        .all()
-    )
-    analyses = {
-        a.call_id: a
-        for a in db.query(LeadAnalysis)
+    calls_query = db.query(AudioCall).filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == current_user.org_id)
+    if s is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp >= s)
+    if e is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp < e)
+    calls = calls_query.all()
+
+    analyses_query = (
+        db.query(LeadAnalysis)
         .join(AudioCall, AudioCall.call_id == LeadAnalysis.call_id)
         .filter(AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == current_user.org_id,
                 LeadAnalysis.status == "completed")
-        .all()
-    }
+    )
+    if s is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp >= s)
+    if e is not None:
+        analyses_query = analyses_query.filter(AudioCall.timestamp < e)
+    analyses = {a.call_id: a for a in analyses_query.all()}
 
     scored_calls = []
     for c in calls:
