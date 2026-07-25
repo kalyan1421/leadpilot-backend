@@ -127,3 +127,27 @@ def test_sync_resolves_lead_id_by_phone_match(client):
     )
     listed = client.get("/api/call-log", headers=headers).json()
     assert listed["calls"][0]["lead_id"] is not None
+
+
+def test_sync_resolves_lead_id_across_phone_formats(client):
+    """The device reports a number in a different format than the lead was
+    saved in (spaces, country-code, trunk-0). Resolution must normalize both
+    sides (normalize_phone) — exact-string matching silently failed to link a
+    large share of real calls to their lead."""
+    headers = _auth_headers(client)
+    # Lead saved compact, no spaces.
+    client.post(
+        "/api/leads",
+        headers=headers,
+        json={"name": "Anil", "phone": "+919876543210", "source": "organic"},
+    )
+    # Same person, three different device-reported formats.
+    for i, dev_phone in enumerate(["+91 98765 43210", "098765 43210", "9876543210"]):
+        client.post(
+            "/api/call-log/sync",
+            headers=headers,
+            json={"entries": [_entry(f"dev-fmt-{i}", phone=dev_phone)]},
+        )
+    listed = client.get("/api/call-log", headers=headers).json()
+    linked = [row for row in listed["calls"] if row["lead_id"] is not None]
+    assert len(linked) == 3, f"all three formats should link to the one lead, got {len(linked)}"

@@ -23,6 +23,7 @@ from app.schemas_call_log import (
     CallLogSyncRequest,
     CallLogSyncResponse,
 )
+from app.utils.memory_bubble import normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +47,21 @@ async def sync_call_log(
 
     # Best-effort resolve each phone to a known lead in this org, so tapping a
     # call-log tile can navigate straight to the lead (same as an app-placed
-    # call already does).
-    phones = {e.phone for e in payload.entries}
-    lead_by_phone = {
-        row.phone: row.id
-        for row in db.query(Lead.id, Lead.phone).filter(
-            Lead.org_id == current_user.org_id, Lead.phone.in_(phones)
-        )
-    }
+    # call already does). Matched on the NORMALIZED phone (normalize_phone —
+    # the codebase's canonical contact identity), not raw string equality: a
+    # device reports a number in a different format than the lead was saved in
+    # (e.g. "+91 98765 43210" vs "9876543210"), so exact-string matching
+    # silently failed to link a large share of real calls to their lead.
+    wanted_keys = {normalize_phone(e.phone) for e in payload.entries}
+    wanted_keys.discard("")
+    lead_by_key: dict[str, str] = {}
+    if wanted_keys:
+        for lead_id_, lead_phone in db.query(Lead.id, Lead.phone).filter(
+            Lead.org_id == current_user.org_id, Lead.phone.isnot(None)
+        ):
+            key = normalize_phone(lead_phone)
+            if key and key in wanted_keys and key not in lead_by_key:
+                lead_by_key[key] = lead_id_
 
     # Manual upsert (not a DB-level ON CONFLICT) so this works identically
     # against the SQLite test DB and production Postgres — same convention
@@ -68,7 +76,7 @@ async def sync_call_log(
 
     synced = 0
     for entry in payload.entries:
-        lead_id = entry.lead_id or lead_by_phone.get(entry.phone)
+        lead_id = entry.lead_id or lead_by_key.get(normalize_phone(entry.phone))
         row = existing_by_device_id.get(entry.device_call_id)
         if row is not None:
             row.duration_seconds = entry.duration_seconds
