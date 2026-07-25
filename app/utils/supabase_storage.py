@@ -173,7 +173,9 @@ class SupabaseStorageManager:
             'm4a': 'audio/mp4',
             'aac': 'audio/aac',
             'ogg': 'audio/ogg',
-            'flac': 'audio/flac'
+            'flac': 'audio/flac',
+            'amr': 'audio/amr',
+            '3gp': 'audio/3gpp',
         }
         return content_types.get(file_extension.lower(), 'audio/mpeg')
 
@@ -187,10 +189,15 @@ class SupabaseStorageManager:
                     return 'mp3'
                 elif header.startswith(b'RIFF') and header[8:12] == b'WAVE':
                     return 'wav'
-                elif header.startswith(b'ftyp'):
-                    ftype = header[4:8]
-                    if ftype in [b'M4A ', b'M4B ', b'M4P ', b'M4V ']:
-                        return 'm4a'
+                elif header[4:8] == b'ftyp':
+                    # Box type is at offset 4 in ISO BMFF, not 0 — see the
+                    # matching fix + comment in LocalStorageManager.
+                    major_brand = header[8:12]
+                    if major_brand.startswith(b'3gp') or major_brand.startswith(b'3g2'):
+                        return '3gp'
+                    return 'm4a'
+                elif header.startswith(b'#!AMR'):
+                    return 'amr'
                 elif header.startswith(b'\xff\xf1') or header.startswith(b'\xff\xf9'):
                     return 'aac'
                 elif header.startswith(b'OggS'):
@@ -199,7 +206,7 @@ class SupabaseStorageManager:
                     return 'flac'
 
                 ext = os.path.splitext(file_path)[1].lower().strip('.')
-                if ext in ['mp3', 'mpeg', 'wav', 'm4a', 'aac', 'ogg', 'flac']:
+                if ext in ['mp3', 'mpeg', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'amr', '3gp']:
                     return ext if ext != 'mpeg' else 'mp3'
 
                 return 'mp3'  # Default fallback

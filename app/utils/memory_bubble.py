@@ -309,10 +309,23 @@ def normalize_phone(phone: Optional[str]) -> str:
     if not phone:
         return ""
     digits = re.sub(r"\D+", "", phone)
-    if len(digits) == 12 and digits.startswith("91"):
-        digits = digits[2:]
-    elif len(digits) == 11 and digits.startswith("0"):
-        digits = digits[1:]
+    # Iteratively peel IDD ("00"), country-code ("91"), and trunk ("0")
+    # prefixes so +91 98765 43210, 0091 98765 43210 (full IDD dial-out),
+    # 098765 43210, and a stray leftover "0" after stripping "91" (e.g. a
+    # contact re-exported as 91 0 98765 43210) all collapse to the same
+    # 10-digit key. A single-pass check here previously missed any
+    # combination beyond a bare 12-digit "91…" or 11-digit "0…", so the same
+    # real number could produce two different contact_keys and split a
+    # contact's calls/leads across two rows.
+    while len(digits) > 10:
+        if digits.startswith("0091"):
+            digits = digits[4:]
+        elif digits.startswith("91"):
+            digits = digits[2:]
+        elif len(digits) == 11 and digits.startswith("0"):
+            digits = digits[1:]
+        else:
+            break
     return digits if len(digits) >= 7 else ""
 
 

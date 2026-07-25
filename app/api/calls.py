@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/calls", tags=["calls"])
 
+# Extensions the OEM dialer folder-scan (call_recording_service.dart) can hand
+# us, plus the common container/codec aliases. Anything else is rejected at
+# upload time rather than failing silently deep inside transcription.
+_ALLOWED_UPLOAD_EXTENSIONS = {
+    "mp3", "mpeg", "m4a", "wav", "aac", "ogg", "flac", "amr", "3gp", "mp4",
+}
+
 # Aggregate / cross-call intelligence lives on its own prefixes so it never
 # collides with the dynamic /api/calls/{call_id} route.
 intel_router = APIRouter(prefix="/api", tags=["intelligence"])
@@ -2202,6 +2209,20 @@ async def upload_recording(
     telecaller_id = current_user.id
 
     file_bytes = await file.read()
+
+    # Reject an unsupported format up front instead of letting it run the full
+    # storage -> transcription pipeline only to die deep inside as an opaque
+    # "failed" status with no actionable message for the telecaller.
+    upload_ext = os.path.splitext(file.filename or "")[1].lstrip(".").lower()
+    if upload_ext and upload_ext not in _ALLOWED_UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported recording format '.{upload_ext}'. Expected one "
+                f"of: {', '.join(sorted(_ALLOWED_UPLOAD_EXTENSIONS))}."
+            ),
+        )
+
     content_hash = hashlib.sha256(file_bytes).hexdigest()
 
     existing = (
@@ -2251,6 +2272,23 @@ async def upload_recording(
     # Org-scoped: contact_key is only unique per-org (see uq_leads_org_contact_key),
     # so an unscoped lookup here could match — or fail to match — another org's lead.
     lead = db.query(Lead).filter(Lead.contact_key == slug, Lead.org_id == org_id).first()
+    # A cached contact_key_override can go stale (the lead was merged, renamed,
+    # or deleted since the client last fetched it). Blindly creating a new Lead
+    # under that stale key would spawn an orphan disconnected from the
+    # contact's real history — the exact "call never shows up" symptom this
+    # override exists to prevent. Fall back to the phone-based lookup before
+    # giving up and creating a new lead.
+    if lead is None and safe_override:
+        phone_slug = normalize_phone(phone)
+        if phone_slug and phone_slug != slug:
+            phone_lead = (
+                db.query(Lead)
+                .filter(Lead.contact_key == phone_slug, Lead.org_id == org_id)
+                .first()
+            )
+            if phone_lead is not None:
+                lead = phone_lead
+                slug = phone_slug
     # LEAD_ASSIGNMENT_SPEC P0-1: a telecaller uploading a call remains the
     # lead's owner (self-assignment, as today). A founder/ad_manager (or any
     # future role) uploading on behalf of the team must NOT become the
