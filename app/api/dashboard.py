@@ -82,14 +82,18 @@ async def get_leads_board(
         out.append({
             "id": lead.id,
             "name": lead.name or lead.contact_key,
+            "phone": lead.phone,
+            "reason": lead.reason,
             "source": lead.source,
             "score": score,
             "pipeline_stage": lead.pipeline_stage,
+            "deal_value": lead.deal_value,
             "telecaller_name": telecallers.get(lead.assigned_to),
             "days_stuck": max(0, days_stuck),
         })
 
     return {"stages": KANBAN_STAGES, "leads": out}
+
 
 
 def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
@@ -551,6 +555,28 @@ async def get_team_status(
             revenue_today_by_tc.get(lead.assigned_to, 0) + (lead.deal_value or 0)
         )
 
+    # Currently-open leads sitting with each telecaller — the Performance
+    # Matrix's "Leads" column. Terminal stages excluded: a telecaller's
+    # working queue, not their all-time assignment count.
+    leads_assigned_by_tc: Dict[str, int] = {tid: 0 for tid in telecaller_ids}
+    for lead in (
+        db.query(Lead)
+        .filter(
+            Lead.org_id == current_user.org_id,
+            Lead.assigned_to.in_(telecaller_ids),
+            Lead.pipeline_stage.notin_(["Closed Won", "Closed Lost", "Junk"]),
+        )
+        .all()
+    ):
+        leads_assigned_by_tc[lead.assigned_to] = leads_assigned_by_tc.get(lead.assigned_to, 0) + 1
+
+    def _idle_minutes(tc_id: str) -> Optional[int]:
+        attendance = attendance_by_tc.get(tc_id)
+        if attendance is None or attendance.check_in_at is None or attendance.check_out_at is not None:
+            return None  # Absent/Inactive telecallers aren't "idling" — they're not on shift
+        reference = last_call_by_tc.get(tc_id) or attendance.check_in_at
+        return max(0, round((now - reference).total_seconds() / 60))
+
     results = [
         {
             "id": tc.id,
@@ -562,6 +588,9 @@ async def get_team_status(
             "quality": metrics_by_tc.get(tc.id, {}).get("quality", 0),
             "trend": metrics_by_tc.get(tc.id, {}).get("trend"),
             "revenue_today": revenue_today_by_tc.get(tc.id, 0),
+            "leads_assigned": leads_assigned_by_tc.get(tc.id, 0),
+            "last_call_at": last_call_by_tc[tc.id].isoformat() if tc.id in last_call_by_tc else None,
+            "idle_minutes": _idle_minutes(tc.id),
         }
         for tc in telecallers
     ]
@@ -1326,6 +1355,150 @@ async def get_leads_zombie(
     return {"leads": zombies, "threshold_days": cfg["zombie_days"]}
 
 
+@router.get("/leads/{lead_id}", status_code=status.HTTP_200_OK)
+async def get_lead_detail(
+    lead_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Everything the Lead Detail screen needs in one call: the lead itself,
+    its full call/touchpoint history with AI scores, the cumulative memory
+    bubble (see app/utils/memory_bubble.py), the next scheduled follow-up, and
+    same-phone duplicate leads. Aggregation only — no field here is invented;
+    a section with nothing behind it (no calls yet, no memory bubble built
+    yet, no follow-up scheduled) comes back null/empty rather than faked.
+    """
+    from app.api.calls import _gather_contact_calls, _serialize_bubble
+    from app.models import FollowUp, MemoryBubble
+
+    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
+    if not lead:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
+
+    telecaller = db.query(User).filter(User.id == lead.assigned_to).first() if lead.assigned_to else None
+
+    calls = _gather_contact_calls(lead.contact_key, db, current_user.org_id)  # oldest first
+    touchpoints = [
+        {
+            "call_id": c["call_id"],
+            "timestamp": c["timestamp"],
+            "lead_verdict": c["analysis"]["lead_verdict"],
+            "score": c["analysis"]["bant_score"],
+            # call_summary is the structured {headline, key_moments, objections_raised,
+            # commitments_made, overall_tone} object (see CallSummary in lib/api.ts) —
+            # the timeline just needs the one-line headline, not the full object.
+            "summary": (c["analysis"]["call_summary"] or {}).get("headline"),
+        }
+        for c in reversed(calls)  # newest first, matching the timeline UI
+    ]
+    score_history = [
+        {"timestamp": c["timestamp"], "score": c["analysis"]["bant_score"]}
+        for c in calls
+        if c["analysis"]["bant_score"] is not None
+    ]
+    latest_score = score_history[-1]["score"] if score_history else None
+
+    bubble_row = (
+        db.query(MemoryBubble)
+        .filter(MemoryBubble.contact_key == lead.contact_key, MemoryBubble.org_id == current_user.org_id)
+        .first()
+    )
+    memory = _serialize_bubble(bubble_row) if bubble_row else None
+
+    follow_up = (
+        db.query(FollowUp)
+        .filter(FollowUp.lead_id == lead.id, FollowUp.org_id == current_user.org_id, FollowUp.completed_at.is_(None))
+        .order_by(FollowUp.due_at.asc())
+        .first()
+    )
+
+    duplicates = []
+    if lead.phone:
+        dupes = (
+            db.query(Lead)
+            .filter(Lead.org_id == current_user.org_id, Lead.phone == lead.phone, Lead.id != lead.id)
+            .all()
+        )
+        duplicates = [{"id": d.id, "name": d.name or d.contact_key, "pipeline_stage": d.pipeline_stage} for d in dupes]
+
+    now = datetime.now(timezone.utc)
+    updated = lead.updated_at or lead.created_at
+    days_stuck = max(0, (now - updated).days) if updated else 0
+
+    return {
+        "id": lead.id,
+        "name": lead.name or lead.contact_key,
+        "phone": lead.phone,
+        "reason": lead.reason,
+        "source": lead.source,
+        "pipeline_stage": lead.pipeline_stage,
+        "deal_value": lead.deal_value,
+        "score": latest_score,
+        "telecaller_name": telecaller.name if telecaller else None,
+        "days_stuck": days_stuck,
+        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+        "touchpoints": touchpoints,
+        "score_history": score_history,
+        "memory": memory,
+        "follow_up": (
+            {"note": follow_up.note, "due_at": follow_up.due_at.isoformat() if follow_up.due_at else None}
+            if follow_up
+            else None
+        ),
+        "duplicates": duplicates,
+    }
+
+
+@router.patch("/leads/{lead_id}/details", status_code=status.HTTP_200_OK)
+async def update_lead_details(
+    lead_id: str,
+    body: Dict[str, Any],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Edits the lead's own fields — name/phone/reason/source/owner/deal value.
+    Deliberately separate from PATCH /leads/{id}/stage, which owns pipeline_stage
+    and its audit trail (LeadStageChange) — mixing the two here would let a
+    plain field edit slip a stage change through without that trail. Only
+    fields actually present in the body are touched (partial update); an
+    unknown field is a 422, not a silent no-op."""
+    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
+    if not lead:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
+
+    editable = {"name", "phone", "reason", "source", "assigned_to", "deal_value"}
+    unknown = set(body.keys()) - editable
+    if unknown:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Unsupported field(s): {sorted(unknown)}")
+
+    if "assigned_to" in body and body["assigned_to"] is not None:
+        owner = (
+            db.query(User)
+            .filter(User.id == body["assigned_to"], User.org_id == current_user.org_id, User.role == "telecaller")
+            .first()
+        )
+        if owner is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="assigned_to must be a telecaller on this org")
+
+    for field in editable:
+        if field in body:
+            setattr(lead, field, body[field])
+
+    db.commit()
+    db.refresh(lead)
+    telecaller = db.query(User).filter(User.id == lead.assigned_to).first() if lead.assigned_to else None
+    return {
+        "id": lead.id,
+        "name": lead.name or lead.contact_key,
+        "phone": lead.phone,
+        "reason": lead.reason,
+        "source": lead.source,
+        "pipeline_stage": lead.pipeline_stage,
+        "deal_value": lead.deal_value,
+        "telecaller_name": telecaller.name if telecaller else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Telecaller performance detail (single telecaller)
 # ---------------------------------------------------------------------------
@@ -1355,6 +1528,28 @@ async def get_telecaller_performance_detail(
     )
     if telecaller is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Telecaller not found")
+
+    # Live status/idle — same rule as /telecallers/status, computed fresh here
+    # (today's attendance + today's last call) regardless of the start/end
+    # params above, which scope the historical metrics, not "is on shift now".
+    now = datetime.now(timezone.utc)
+    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+    today_attendance = (
+        db.query(Attendance)
+        .filter(Attendance.org_id == current_user.org_id, Attendance.user_id == telecaller_id, Attendance.date == now.date())
+        .first()
+    )
+    today_last_call = (
+        db.query(AudioCall)
+        .filter(AudioCall.org_id == current_user.org_id, AudioCall.telecaller_id == telecaller_id, AudioCall.timestamp >= today_start)
+        .order_by(AudioCall.timestamp.desc())
+        .first()
+    )
+    today_last_call_at = today_last_call.timestamp if today_last_call else None
+    live_status = _telecaller_status(now, today_attendance, today_last_call_at)
+    idle_minutes = None
+    if today_attendance is not None and today_attendance.check_in_at is not None and today_attendance.check_out_at is None:
+        idle_minutes = max(0, round((now - (today_last_call_at or today_attendance.check_in_at)).total_seconds() / 60))
 
     metrics = _telecaller_metrics(db, telecaller_id, current_user.org_id, start=s, end=e)
 
@@ -1409,13 +1604,65 @@ async def get_telecaller_performance_detail(
         for c in timeline_calls
     ]
 
+    # Last 14 real calendar days, zero-filled — the chart's own fixed window,
+    # independent of the start/end params above (those scope the summary
+    # metrics; this always answers "how did the last two weeks look").
+    today = datetime.now(timezone.utc).date()
+    window_start_date = today - timedelta(days=13)
+    window_start = datetime(window_start_date.year, window_start_date.month, window_start_date.day, tzinfo=timezone.utc)
+    recent_calls = (
+        db.query(AudioCall)
+        .filter(
+            AudioCall.telecaller_id == telecaller_id,
+            AudioCall.org_id == current_user.org_id,
+            AudioCall.timestamp >= window_start,
+        )
+        .all()
+    )
+    counts_by_day: Dict[str, int] = {}
+    for c in recent_calls:
+        if c.timestamp is None:
+            continue
+        key = _utc_date(c.timestamp).isoformat()
+        counts_by_day[key] = counts_by_day.get(key, 0) + 1
+    daily_calls = [
+        {"date": (window_start_date + timedelta(days=i)).isoformat(), "count": counts_by_day.get((window_start_date + timedelta(days=i)).isoformat(), 0)}
+        for i in range(14)
+    ]
+
+    # Currently open leads sitting with this telecaller — same terminal-stage
+    # exclusion as /telecallers/status's leads_assigned count, but the actual
+    # rows here since the detail page lists them, not just counts them.
+    open_leads = (
+        db.query(Lead)
+        .filter(
+            Lead.org_id == current_user.org_id,
+            Lead.assigned_to == telecaller_id,
+            Lead.pipeline_stage.notin_(["Closed Won", "Closed Lost", "Junk"]),
+        )
+        .all()
+    )
+    leads_assigned = [
+        {
+            "id": l.id,
+            "name": l.name or l.contact_key,
+            "pipeline_stage": l.pipeline_stage,
+            "deal_value": l.deal_value,
+        }
+        for l in open_leads
+    ]
+
     return {
         "id": telecaller.id,
         "name": telecaller.name,
+        "status": live_status,
+        "idle_minutes": idle_minutes,
         **metrics,
         "best_calls": best_calls,
         "needs_review": needs_review,
         "timeline": timeline,
+        "daily_calls": daily_calls,
+        "leads_assigned": leads_assigned,
     }
 
 
@@ -1507,7 +1754,7 @@ async def get_insights(
 # Report preview
 # ---------------------------------------------------------------------------
 
-_REPORT_TYPES = ["weekly_summary", "telecaller_performance", "lead_quality"]
+_REPORT_TYPES = ["weekly_summary", "telecaller_performance", "lead_quality", "leakage"]
 
 
 async def _telecaller_performance_payload(db: Session, org_id: str) -> Dict[str, Any]:
@@ -1563,8 +1810,18 @@ async def get_report_preview(
         data["wastage_count"] = len(_wasted_leads(db, org_id, cfg["wastage_days"]))
     elif report_type == "telecaller_performance":
         data = await _telecaller_performance_payload(db, org_id)
-    else:  # lead_quality
+    elif report_type == "lead_quality":
         data = _lead_quality(db, org_id)
+    else:  # leakage
+        cfg = _alert_config(db, org_id)
+        wasted = _wasted_leads(db, org_id, cfg["wastage_days"])
+        zombies = _zombie_leads(db, org_id, cfg["zombie_days"])
+        data = {
+            "wastage_threshold_days": cfg["wastage_days"],
+            "zombie_threshold_days": cfg["zombie_days"],
+            "wasted_leads": wasted,
+            "zombie_leads": zombies,
+        }
 
     return {
         "report_type": report_type,

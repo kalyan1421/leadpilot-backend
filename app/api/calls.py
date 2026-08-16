@@ -782,6 +782,44 @@ def _dimension_status() -> Dict[str, str]:
 #  single _all_analyses_by_contact scan, avoiding a second full-table scan per request.)
 
 
+@router.get("/{call_id}/header", status_code=status.HTTP_200_OK)
+async def get_call_header(
+    call_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(_get_current_user),
+):
+    """Minimal who/when/how-long for the Call Analysis page's title bar —
+    deliberately separate from the strict AudioCallResponse schema (GET
+    /{call_id}) so this can freely add lead/telecaller names without
+    touching a response_model other callers may depend on."""
+    from app.models import Lead, User
+    from app.utils.memory_bubble import contact_key_from_call_id
+
+    call = (
+        db.query(AudioCall)
+        .filter(AudioCall.call_id == call_id, AudioCall.org_id == current_user.org_id)
+        .first()
+    )
+    if not call:
+        raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
+
+    contact_key = contact_key_from_call_id(call_id)
+    lead = db.query(Lead).filter(Lead.org_id == current_user.org_id, Lead.contact_key == contact_key).first()
+    telecaller = db.query(User).filter(User.id == call.telecaller_id).first() if call.telecaller_id else None
+
+    turns = (call.transcript or {}).get("turns", []) if isinstance(call.transcript, dict) else []
+    last_ts = turns[-1].get("timestamp") if turns else None  # "MM:SS", last turn ~= call length
+
+    return {
+        "call_id": call.call_id,
+        "lead_id": lead.id if lead else None,
+        "lead_name": lead.name if lead and lead.name else contact_key,
+        "telecaller_name": telecaller.name if telecaller else None,
+        "timestamp": call.timestamp.isoformat() if call.timestamp else None,
+        "duration_label": last_ts,
+    }
+
+
 @router.get("/{call_id}/score", status_code=status.HTTP_200_OK)
 async def get_call_score(
     call_id: str,
