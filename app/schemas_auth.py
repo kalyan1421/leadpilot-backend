@@ -73,6 +73,9 @@ class AlertConfig(BaseModel):
     zombie_days: Optional[int] = Field(None, ge=1, le=90)
     performance_gap: Optional[int] = Field(None, ge=1, le=110)
     quality_floor: Optional[int] = Field(None, ge=0, le=100)
+    # Team Health board (Active/Break/Inactive) idle thresholds, in minutes.
+    break_threshold_min: Optional[int] = Field(None, ge=1, le=180)
+    inactive_threshold_min: Optional[int] = Field(None, ge=1, le=480)
 
 
 class OrgProfileRequest(BaseModel):

@@ -14,6 +14,7 @@ from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api.attendance import IST, _today_ist
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
 from app.models import Attendance, AudioCall, Lead, LeadAnalysis, LeadStageChange, Organization, User
@@ -30,6 +31,17 @@ KANBAN_STAGES = [
 ]
 
 _DIMENSIONS = DEBRIEF_DIMENSIONS
+
+# Built-in alert/status thresholds — used when an org hasn't set its own
+# alert_config (settings → Alert Configuration). Keys mirror schemas_auth.AlertConfig.
+_ALERT_DEFAULTS = {
+    "wastage_days": 3,
+    "zombie_days": 7,
+    "performance_gap": 15,
+    "quality_floor": 40,
+    "break_threshold_min": 15,
+    "inactive_threshold_min": 45,
+}
 
 
 def _aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -507,15 +519,17 @@ async def get_telecaller_performance(
 
 # PRD's own status thresholds (Section 1-B "Status Definitions"):
 # Active = on a call or logged in and making calls
-# Break = logged in, no call in the last 15 min
-# Inactive = no call in the last 45 min, or logged out
+# Break = logged in, no call in the last N min (org-configurable, see _alert_config)
+# Inactive = no call in the last M min, or logged out
 # Absent = not logged in during working hours
-_BREAK_THRESHOLD_MIN = 15
-_INACTIVE_THRESHOLD_MIN = 45
 
 
 def _telecaller_status(
-    now: datetime, attendance: Optional[Attendance], last_call_at: Optional[datetime]
+    now: datetime,
+    attendance: Optional[Attendance],
+    last_call_at: Optional[datetime],
+    break_threshold_min: int = _ALERT_DEFAULTS["break_threshold_min"],
+    inactive_threshold_min: int = _ALERT_DEFAULTS["inactive_threshold_min"],
 ) -> str:
     """Heuristic status derived from existing Attendance + AudioCall timestamps.
     There's no live presence/break-toggle system in this codebase, so this
@@ -529,9 +543,9 @@ def _telecaller_status(
 
     reference = _aware(last_call_at or attendance.check_in_at)
     minutes_since = (now - reference).total_seconds() / 60
-    if minutes_since <= _BREAK_THRESHOLD_MIN:
+    if minutes_since <= break_threshold_min:
         return "Active"
-    if minutes_since <= _INACTIVE_THRESHOLD_MIN:
+    if minutes_since <= inactive_threshold_min:
         return "Break"
     return "Inactive"
 
@@ -553,8 +567,12 @@ async def get_team_status(
     telecaller_ids = [tc.id for tc in telecallers]
 
     now = datetime.now(timezone.utc)
-    today = now.date()
-    start_of_today = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+    # "Today" is bucketed in IST (see attendance.py) — using the UTC calendar
+    # date here would miss a just-checked-in telecaller's Attendance row
+    # during the ~5.5h window where IST's date is already ahead of UTC's.
+    today = _today_ist()
+    start_of_today = datetime.combine(today, datetime.min.time(), tzinfo=IST)
+    cfg = _alert_config(db, current_user.org_id)
 
     metrics_by_tc = _telecaller_metrics_batch(db, telecaller_ids, current_user.org_id)
 
@@ -623,7 +641,13 @@ async def get_team_status(
         {
             "id": tc.id,
             "name": tc.name,
-            "status": _telecaller_status(now, attendance_by_tc.get(tc.id), last_call_by_tc.get(tc.id)),
+            "status": _telecaller_status(
+                now,
+                attendance_by_tc.get(tc.id),
+                last_call_by_tc.get(tc.id),
+                cfg["break_threshold_min"],
+                cfg["inactive_threshold_min"],
+            ),
             "calls": metrics_by_tc.get(tc.id, {}).get("calls", 0),
             "connected": metrics_by_tc.get(tc.id, {}).get("connected", 0),
             "closed_won": metrics_by_tc.get(tc.id, {}).get("closed_won", 0),
@@ -1285,10 +1309,6 @@ async def get_leads_ageing(
 # Lead wastage — leads with zero calls, aged out
 # ---------------------------------------------------------------------------
 
-# Built-in alert thresholds — used when an org hasn't set its own alert_config
-# (settings → Alert Configuration). Keys mirror schemas_auth.AlertConfig.
-_ALERT_DEFAULTS = {"wastage_days": 3, "zombie_days": 7, "performance_gap": 15, "quality_floor": 40}
-
 
 def _alert_config(db: Session, org_id: str) -> Dict[str, int]:
     """Merge an org's saved alert thresholds over the built-in defaults, keeping
@@ -1631,10 +1651,15 @@ async def get_telecaller_performance_detail(
     # (today's attendance + today's last call) regardless of the start/end
     # params above, which scope the historical metrics, not "is on shift now".
     now = datetime.now(timezone.utc)
-    today_start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+    # "Today" is bucketed in IST (see attendance.py) — using the UTC calendar
+    # date here would miss a just-checked-in telecaller's Attendance row
+    # during the ~5.5h window where IST's date is already ahead of UTC's.
+    today_ist = _today_ist()
+    today_start = datetime.combine(today_ist, datetime.min.time(), tzinfo=IST)
+    cfg = _alert_config(db, current_user.org_id)
     today_attendance = (
         db.query(Attendance)
-        .filter(Attendance.org_id == current_user.org_id, Attendance.user_id == telecaller_id, Attendance.date == now.date())
+        .filter(Attendance.org_id == current_user.org_id, Attendance.user_id == telecaller_id, Attendance.date == today_ist)
         .first()
     )
     today_last_call = (
@@ -1644,7 +1669,9 @@ async def get_telecaller_performance_detail(
         .first()
     )
     today_last_call_at = _aware(today_last_call.timestamp if today_last_call else None)
-    live_status = _telecaller_status(now, today_attendance, today_last_call_at)
+    live_status = _telecaller_status(
+        now, today_attendance, today_last_call_at, cfg["break_threshold_min"], cfg["inactive_threshold_min"]
+    )
     idle_minutes = None
     if today_attendance is not None and today_attendance.check_in_at is not None and today_attendance.check_out_at is None:
         idle_minutes = max(0, round((now - (today_last_call_at or today_attendance.check_in_at)).total_seconds() / 60))
