@@ -52,6 +52,9 @@ webapp/frontend/build/
 !.env.production
 !.env.example
 
+# Firebase Admin SDK service account key (secret — never commit)
+secrets/
+
 # IDE
 .vscode/
 .idea/

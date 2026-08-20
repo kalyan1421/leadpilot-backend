@@ -16,6 +16,7 @@ from app.database import get_db
 from app.models import AudioCall
 from app.schemas import AudioCallResponse, AudioCallUpdate, LeadAnalysisUpdate
 from app.utils.s3 import s3_manager
+from app.utils.push_notifications import send_push_to_user
 from app.config import settings
 from app.api.auth import get_current_user as _get_current_user
 
@@ -1800,6 +1801,13 @@ async def create_lead(
         raise HTTPException(
             status_code=409,
             detail="Could not save lead due to a data integrity error. Your account may be out of sync with the database — log out and back in, and if it persists the org/user records need reseeding.",
+        )
+    if assigned_to and assigned_to != current_user.id:
+        send_push_to_user(
+            db, assigned_to,
+            title="New lead assigned",
+            body=f"{name} has been assigned to you",
+            data={"type": "lead_assigned", "lead_id": lead.id},
         )
     return {"contact_key": contact_key, "name": name, "status": "new", "created": True}
 

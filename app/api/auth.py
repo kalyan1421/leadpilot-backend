@@ -5,7 +5,7 @@ platform (web portals + mobile) — there is no separate NestJS auth service.
 import logging
 import re
 import uuid
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -190,6 +190,24 @@ async def login(request: Request, body: LoginRequest, db: Session = Depends(get_
 @router.get("/me", response_model=UserResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return _to_user_response(current_user)
+
+
+@router.post("/fcm-token", status_code=status.HTTP_204_NO_CONTENT)
+async def register_fcm_token(
+    body: Dict[str, Any],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Registers/refreshes this device's Firebase Cloud Messaging token so
+    push_notifications.send_push_to_user can actually reach it. Called on
+    every successful login and whenever FCM rotates the token — one token per
+    user (the telecaller app is single-device in practice), so this always
+    overwrites rather than appending."""
+    token = (body.get("token") or "").strip()
+    if not token:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="token is required")
+    current_user.fcm_token = token
+    db.commit()
 
 
 @router.post("/change-password", response_model=UserResponse)

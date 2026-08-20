@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     # otherwise silently disable the JWT check too).
     allow_insecure_jwt_secret: bool = False
 
+    # Push notifications (Firebase Admin SDK -> telecaller app FCM). Neither
+    # set -> push_notifications.send_push_to_user quietly no-ops. Local dev
+    # uses a file path (see secrets/); Render has no persistent filesystem to
+    # point a path at, so prod sets the raw JSON content instead.
+    firebase_service_account_file: Optional[str] = None
+    firebase_service_account_json: Optional[str] = None
+
     class Config:
         env_file = ".env"
         case_sensitive = False

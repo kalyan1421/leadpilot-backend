@@ -20,6 +20,7 @@ from app.api.auth import require_role
 from app.database import get_db
 from app.models import AudioCall, Lead, LeadAnalysis, User
 from app.utils.lead_intelligence import averaged_debrief_dimensions
+from app.utils.push_notifications import send_push_to_user
 from app.schemas_team import (
     InviteMemberRequest,
     InviteMemberResponse,
@@ -207,13 +208,22 @@ async def update_member(
         if body.role == "founder" and current_user.role != "founder":
             raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Only a founder can grant the founder role")
         user.role = body.role
+    deactivated = False
     if body.is_active is not None:
         if user.id == current_user.id and body.is_active is False:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Cannot deactivate your own account")
+        deactivated = body.is_active is False and user.is_active is True
         user.is_active = body.is_active
 
     db.commit()
     db.refresh(user)
+    if deactivated:
+        send_push_to_user(
+            db, user.id,
+            title="Account deactivated",
+            body="Your account has been deactivated by your founder",
+            data={"type": "account_deactivated"},
+        )
     metrics = _member_metrics_batch(db, [user.id])[user.id]
     return _to_member_response(user, metrics)
 
@@ -243,6 +253,15 @@ async def reset_member_password(
     user.must_reset_password = True
     db.commit()
     db.refresh(user)
+    # The new password itself never goes in the push payload — FCM isn't a
+    # secure channel for it, and the founder already shares it out of band
+    # (same as invite_member). This just tells the telecaller to expect it.
+    send_push_to_user(
+        db, user.id,
+        title="Password reset",
+        body="Your founder reset your password — ask them for the new one",
+        data={"type": "password_reset"},
+    )
 
     metrics = _member_metrics_batch(db, [user.id])[user.id]
     return InviteMemberResponse(member=_to_member_response(user, metrics), temp_password=new_password)

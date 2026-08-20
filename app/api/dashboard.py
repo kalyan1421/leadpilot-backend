@@ -20,6 +20,7 @@ from app.database import get_db
 from app.models import Attendance, AudioCall, Lead, LeadAnalysis, LeadStageChange, Organization, User
 from app.utils.lead_intelligence import DEBRIEF_DIMENSIONS, averaged_debrief_dimensions, mmss_to_seconds
 from app.utils.memory_bubble import contact_key_from_call_id
+from app.utils.push_notifications import send_push_to_user
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +249,23 @@ async def update_lead_stage(
     lead = _apply_stage_update(lead, body)
     _log_stage_change(db, lead, current_user, previous_stage, body.get("note"))
     db.commit()
+    # This is the by-Lead.id path only the web Kanban calls (the mobile app
+    # only ever knows a lead by contact_key, see update_lead_stage_by_contact
+    # below) — so a change here is always founder/admin-driven, and the
+    # telecaller who owns the lead should hear about it rather than finding
+    # out next time they open the app.
+    if (
+        current_user.role in ("founder", "admin")
+        and lead.assigned_to
+        and lead.assigned_to != current_user.id
+        and lead.pipeline_stage != previous_stage
+    ):
+        send_push_to_user(
+            db, lead.assigned_to,
+            title="Lead stage updated",
+            body=f"{lead.name or lead.contact_key} moved to {lead.pipeline_stage}",
+            data={"type": "stage_changed", "lead_id": lead.id},
+        )
     return {
         "id": lead.id,
         "pipeline_stage": lead.pipeline_stage,
@@ -1574,6 +1592,7 @@ async def update_lead_details(
     if not lead:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
 
+    previous_assigned_to = lead.assigned_to
     editable = {"name", "phone", "reason", "source", "assigned_to", "deal_value"}
     unknown = set(body.keys()) - editable
     if unknown:
@@ -1604,6 +1623,13 @@ async def update_lead_details(
 
     db.commit()
     db.refresh(lead)
+    if lead.assigned_to and lead.assigned_to != previous_assigned_to:
+        send_push_to_user(
+            db, lead.assigned_to,
+            title="New lead assigned",
+            body=f"{lead.name or lead.contact_key} has been assigned to you",
+            data={"type": "lead_assigned", "lead_id": lead.id},
+        )
     telecaller = db.query(User).filter(User.id == lead.assigned_to).first() if lead.assigned_to else None
     return {
         "id": lead.id,

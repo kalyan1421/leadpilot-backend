@@ -99,6 +99,12 @@ class User(Base):
     # founder already chose their own password at signup).
     must_reset_password = Column(Boolean, nullable=False, default=False)
 
+    # FCM registration token for this user's device — one per user (the
+    # telecaller app is single-device in practice; a fresh login/token refresh
+    # simply overwrites it). Null until the app registers one. See
+    # app/utils/push_notifications.py for how this gets used.
+    fcm_token = Column(String(512), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
