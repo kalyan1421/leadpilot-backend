@@ -1683,7 +1683,7 @@ async def create_lead(
     import uuid as _uuid
     from sqlalchemy.exc import IntegrityError
     from app.models import Lead
-    from app.utils.memory_bubble import slugify_contact
+    from app.utils.memory_bubble import normalize_phone, slugify_contact
 
     name = (payload.get("name") or "").strip()
     if not name:
@@ -1703,12 +1703,31 @@ async def create_lead(
         else _pick_telecaller_for_assignment(db, org_id)
     )
 
-    contact_key = slugify_contact(name)
+    # Phone-primary, same convention as upload_recording — a call uploaded
+    # later for this same phone (no override) derives its own contact_key
+    # the identical way, so it correctly attaches to THIS lead instead of
+    # spawning an orphaned second one. Only fall back to a name slug when no
+    # phone was given.
+    phone_slug = normalize_phone(payload.get("phone"))
+    name_slug = slugify_contact(name)
+    contact_key = phone_slug or name_slug
+
     existing = (
         db.query(Lead)
         .filter(Lead.contact_key == contact_key, Lead.org_id == org_id)
         .first()
     )
+    # A phone was given but this lead already exists under its OLD name-slug
+    # key (created before a phone number was on file, or before this fix) —
+    # two different display names for the same real person (a typo,
+    # "Rakesh S." vs "Rakesh Sharma") also slugify differently. Reuse that
+    # row instead of spawning a second, orphaned Lead/history split.
+    if existing is None and phone_slug and phone_slug != name_slug:
+        existing = (
+            db.query(Lead)
+            .filter(Lead.contact_key == name_slug, Lead.org_id == org_id)
+            .first()
+        )
     if existing:
         # update light fields, keep it idempotent
         existing.phone = payload.get("phone") or existing.phone
@@ -2257,6 +2276,7 @@ async def upload_recording(
     import hashlib
     import uuid as _uuid
     from app.models import Lead
+    from sqlalchemy.exc import IntegrityError
     from app.utils.s3 import get_storage_manager
     from app.utils.memory_bubble import slugify_contact, normalize_phone
 
@@ -2374,7 +2394,20 @@ async def upload_recording(
                 if current_user.role == "telecaller"
                 else _pick_telecaller_for_assignment(db, org_id)
             )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two near-simultaneous uploads for a brand-new contact (double-tap,
+        # or an outbox retry racing a slow first attempt) can both pass the
+        # "no existing lead" check above and both try to INSERT for the same
+        # (org_id, contact_key) — unlike create_lead, which already handles
+        # this exact race, this commit was unguarded and the loser's
+        # IntegrityError propagated as a bare 500. Re-query and reuse the
+        # row that won instead, same as create_lead.
+        db.rollback()
+        lead = db.query(Lead).filter(Lead.contact_key == slug, Lead.org_id == org_id).first()
+        if lead is None:
+            raise HTTPException(status_code=500, detail="Could not save lead due to a data integrity error.")
 
     # Persist the upload to a temp file, then into local storage.
     # (file_bytes was already read above, into the hash — write that same
