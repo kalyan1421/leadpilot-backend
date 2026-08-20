@@ -80,7 +80,7 @@ class S3Manager:
             Local filesystem path to the downloaded audio, or None if no
             audio object exists for this call.
         """
-        for ext in ('mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac'):
+        for ext in ('mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'amr', '3gp', 'mp4'):
             s3_key = f"calls/{call_id}/audio.{ext}"
             try:
                 response = self.s3_client.get_object(Bucket=self.bucket_name, Key=s3_key)
@@ -197,39 +197,56 @@ class S3Manager:
             'm4a': 'audio/mp4',
             'aac': 'audio/aac',
             'ogg': 'audio/ogg',
-            'flac': 'audio/flac'
+            'flac': 'audio/flac',
+            'amr': 'audio/amr',
+            '3gp': 'audio/3gpp',
         }
         return content_types.get(file_extension.lower(), 'audio/mpeg')
-    
+
     def _detect_audio_format_from_headers(self, file_path: str) -> str:
-        """Detect audio format by examining file headers."""
+        """Detect audio format by examining file headers.
+
+        Kept in sync with local_storage.py's / supabase_storage.py's
+        identically-named detector — this one was never updated when
+        AMR/3GP support was added to the other two, so under S3 storage an
+        AMR/3GP recording (common on Xiaomi/Vivo/Oppo OEM dialers) silently
+        fell through to the mp3 default, and even M4A detection never fired
+        (the ISO-BMFF box type sits at header offset 4, not 0 — startswith
+        checked the wrong slice)."""
         try:
             with open(file_path, 'rb') as f:
                 # Read first 16 bytes to examine file headers
                 header = f.read(16)
-                
+
                 # Check for common audio file signatures
                 if header.startswith(b'ID3') or header.startswith(b'\xff\xfb') or header.startswith(b'\xff\xf3'):
                     return 'mp3'
                 elif header.startswith(b'RIFF') and header[8:12] == b'WAVE':
                     return 'wav'
-                elif header.startswith(b'ftyp'):
-                    # Check for MP4/AAC variants
-                    ftype = header[4:8]
-                    if ftype in [b'M4A ', b'M4B ', b'M4P ', b'M4V ']:
+                elif header[4:8] == b'ftyp':
+                    # ISO base media (MP4/M4A/3GP) box layout is
+                    # [size:4][b"ftyp"][major_brand:4]... — the box type sits
+                    # at offset 4, not 0.
+                    major_brand = header[8:12]
+                    if major_brand.startswith(b'3gp') or major_brand.startswith(b'3g2'):
+                        return '3gp'
+                    elif major_brand in [b'M4A ', b'M4B ', b'M4P ', b'M4V ']:
                         return 'm4a'
-                    elif ftype == b'MP4 ':
+                    elif major_brand == b'MP4 ':
                         return 'mp4'
+                    return 'm4a'
+                elif header.startswith(b'#!AMR'):
+                    return 'amr'
                 elif header.startswith(b'\xff\xf1') or header.startswith(b'\xff\xf9'):
                     return 'aac'
                 elif header.startswith(b'OggS'):
                     return 'ogg'
                 elif header.startswith(b'fLaC'):
                     return 'flac'
-                
+
                 logger.warning(f"Could not detect audio format from headers for {file_path}")
                 return 'mp3'  # Default fallback
-                
+
         except Exception as e:
             logger.error(f"Error detecting audio format from headers: {e}")
             return 'mp3'  # Default fallback
@@ -259,7 +276,7 @@ class S3Manager:
             if "." in filename:
                 extension = filename.split(".")[-1].split("?")[0]
                 # Validate that it's a reasonable audio extension
-                if extension.lower() in ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'mp4']:
+                if extension.lower() in ['mp3', 'wav', 'm4a', 'aac', 'ogg', 'flac', 'mp4', 'amr', '3gp']:
                     return extension.lower()
                 else:
                     logger.warning(f"Invalid audio extension '{extension}' from URL, using default 'mp3'")
