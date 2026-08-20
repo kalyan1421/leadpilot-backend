@@ -22,12 +22,21 @@ and cheap even with many calls.
 import json
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional
 
 from app.config import settings
 from app.utils.sarvam import sarvam_extract
 
 logger = logging.getLogger(__name__)
+
+# Same light-retry shape as lead_analyzer.py/precall_brief.py — without this,
+# a single transient Sarvam error (rate limit, timeout) permanently
+# regressed a contact's real, multi-call memory bubble back to "no history
+# yet" (see build()'s failure path below), since this rebuild runs after
+# every call analysed for that contact.
+_MAX_RETRIES = 2
+_RETRY_BASE = 2.0
 
 # Bounds the memory-bubble prompt to the most recent N calls regardless of how many
 # total calls a contact has had. Without this, a high-touch lead's every new call
@@ -124,10 +133,18 @@ class MemoryBubbleBuilder:
         """
         calls: list (oldest first) of dicts:
           {"call_id", "timestamp", "analysis": <lead_analysis dict>}
-        Returns the memory bubble dict, or a minimal empty bubble on failure.
+        Returns the memory bubble dict, or None if it couldn't be built.
+
+        Deliberately returns None (not a minimal/empty bubble) on failure —
+        this runs after EVERY call analysed for a contact, and every caller
+        (see _build_and_store_memory / _rebuild_memory_for_call in
+        app/api/calls.py) already skips the DB write on a falsy result. An
+        empty-but-truthy bubble used to sail past that guard and overwrite a
+        real, multi-call memory with "no history yet" on a single transient
+        provider error — silent data loss on the product's own stated moat.
         """
         if not calls:
-            return self._empty(contact_key)
+            return None
 
         total_calls = len(calls)
         recent_calls = calls[-_MAX_MEMORY_CALLS:]
@@ -142,15 +159,9 @@ class MemoryBubbleBuilder:
             logger.info(
                 f"Building memory bubble for {contact_key} from {len(recent_calls)}/{total_calls} call(s)"
             )
-            data = sarvam_extract(
-                [
-                    {"role": "system", "content": "You synthesise cumulative sales memory for a prospect."},
-                    {"role": "user", "content": _MEMORY_PROMPT.format(calls_block=calls_block, shown_desc=shown_desc)},
-                ],
-                schema=_MEMORY_SCHEMA, tool_name="record_memory", model=self.model, max_tokens=2000,
-            )
+            data = self._call(calls_block, shown_desc)
             if not data:
-                return self._empty(contact_key)
+                return None
 
             data["contact_key"] = contact_key
             data["total_calls"] = total_calls
@@ -160,7 +171,31 @@ class MemoryBubbleBuilder:
             return data
         except Exception as e:
             logger.error(f"Memory bubble build failed for {contact_key}: {e}", exc_info=True)
-            return self._empty(contact_key)
+            return None
+
+    def _call(self, calls_block: str, shown_desc: str) -> Optional[Dict[str, Any]]:
+        """LLM call with a light retry — see the module-level comment on
+        _MAX_RETRIES for why this exists."""
+        last: Optional[Exception] = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return sarvam_extract(
+                    [
+                        {"role": "system", "content": "You synthesise cumulative sales memory for a prospect."},
+                        {
+                            "role": "user",
+                            "content": _MEMORY_PROMPT.format(calls_block=calls_block, shown_desc=shown_desc),
+                        },
+                    ],
+                    schema=_MEMORY_SCHEMA, tool_name="record_memory", model=self.model, max_tokens=2000,
+                )
+            except Exception as e:
+                last = e
+                logger.warning(f"memory_bubble attempt {attempt + 1} failed: {str(e)[:120]}")
+                if attempt < _MAX_RETRIES:
+                    time.sleep(_RETRY_BASE * (attempt + 1))
+        logger.error(f"memory_bubble failed after retries: {last}")
+        return None
 
     # ------------------------------------------------------------------
 
