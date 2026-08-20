@@ -32,6 +32,20 @@ KANBAN_STAGES = [
 _DIMENSIONS = DEBRIEF_DIMENSIONS
 
 
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a DB-sourced datetime to UTC-aware before it's subtracted
+    from `datetime.now(timezone.utc)` anywhere in this file. Postgres'
+    DateTime(timezone=True) columns round-trip aware datetimes in
+    production, but SQLite (the test DB) silently drops tzinfo — without
+    this, every `days_stuck`/`idle_minutes`-style calculation below raises
+    `TypeError: can't subtract offset-naive and offset-aware datetimes` the
+    moment it hits a naive value, in tests today and for any legacy/migrated
+    row missing tz info in the future."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Leads board (kanban)
 # ---------------------------------------------------------------------------
@@ -59,7 +73,7 @@ def _latest_scores_by_contact(db: Session, org_id: str) -> Dict[str, float]:
 
 @router.get("/leads/board", status_code=status.HTTP_200_OK)
 async def get_leads_board(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     leads = db.query(Lead).filter(Lead.org_id == current_user.org_id).all()
@@ -78,7 +92,7 @@ async def get_leads_board(
         score = scores_by_contact.get(lead.contact_key)
         score = round(score) if score is not None else None
 
-        updated = lead.updated_at or lead.created_at
+        updated = _aware(lead.updated_at or lead.created_at)
         days_stuck = (now - updated).days if updated else 0
 
         out.append({
@@ -487,7 +501,7 @@ def _telecaller_status(
     if attendance.check_out_at is not None:
         return "Inactive"
 
-    reference = last_call_at or attendance.check_in_at
+    reference = _aware(last_call_at or attendance.check_in_at)
     minutes_since = (now - reference).total_seconds() / 60
     if minutes_since <= _BREAK_THRESHOLD_MIN:
         return "Active"
@@ -576,7 +590,7 @@ async def get_team_status(
         attendance = attendance_by_tc.get(tc_id)
         if attendance is None or attendance.check_in_at is None or attendance.check_out_at is not None:
             return None  # Absent/Inactive telecallers aren't "idling" — they're not on shift
-        reference = last_call_by_tc.get(tc_id) or attendance.check_in_at
+        reference = _aware(last_call_by_tc.get(tc_id) or attendance.check_in_at)
         return max(0, round((now - reference).total_seconds() / 60))
 
     results = [
@@ -808,7 +822,7 @@ def _parse_snapshot_date(value: Optional[str], *, field: str) -> Optional[dateti
 async def get_dashboard_snapshot(
     start: Optional[str] = None,
     end: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """`start`/`end` (YYYY-MM-DD, inclusive) scope the new-lead and call counts to
@@ -1002,7 +1016,7 @@ _ACTIVE_QUEUE_STAGES = ["New", "Assigned", "Contacted", "Interested", "Proposal 
 
 @router.get("/dashboard/activity", status_code=status.HTTP_200_OK)
 async def get_dashboard_activity(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     org_id = current_user.org_id
@@ -1074,7 +1088,7 @@ async def get_dashboard_activity(
         queue = queue_counts.get(tc.id, 0)
         if queue == 0:
             continue
-        last_call = last_call_by_tc.get(tc.id)
+        last_call = _aware(last_call_by_tc.get(tc.id))
         idle_minutes = int((now - last_call).total_seconds() / 60) if last_call else None
         if idle_minutes is not None and idle_minutes < _IDLE_THRESHOLD_MINUTES:
             continue
@@ -1171,7 +1185,7 @@ def _lead_quality(db: Session, org_id: str) -> Dict[str, Any]:
 
 @router.get("/leads/quality", status_code=status.HTTP_200_OK)
 async def get_leads_quality(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     return _lead_quality(db, current_user.org_id)
@@ -1182,7 +1196,7 @@ _SCORE_BANDS = [(81, 100, "81-100"), (61, 80, "61-80"), (41, 60, "41-60"), (21, 
 
 @router.get("/leads/score-distribution", status_code=status.HTTP_200_OK)
 async def get_score_distribution(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """Buckets each contact's latest BANT score into the PRD's 5 bands, with
@@ -1208,7 +1222,7 @@ async def get_score_distribution(
 
 @router.get("/leads/ageing", status_code=status.HTTP_200_OK)
 async def get_leads_ageing(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """Buckets open (non-terminal) leads by days-since-last-update (PRD Layer
@@ -1225,7 +1239,7 @@ async def get_leads_ageing(
     summary = {"0-3": 0, "3-7": 0, "7+": 0}
     rows = []
     for lead in leads:
-        updated = lead.updated_at or lead.created_at
+        updated = _aware(lead.updated_at or lead.created_at)
         days = max(0, (now - updated).days) if updated else 0
         bucket = "0-3" if days <= 3 else "3-7" if days <= 7 else "7+"
         summary[bucket] += 1
@@ -1282,7 +1296,7 @@ def _wasted_leads(db: Session, org_id: str, threshold_days: int = 3) -> List[Dic
     for lead in leads:
         if lead.contact_key in called_contact_keys:
             continue
-        created = lead.created_at or now
+        created = _aware(lead.created_at) or now
         days_since_created = (now - created).days
         if days_since_created >= threshold_days:
             wasted.append({
@@ -1299,7 +1313,7 @@ def _wasted_leads(db: Session, org_id: str, threshold_days: int = 3) -> List[Dic
 
 @router.get("/leads/wastage", status_code=status.HTTP_200_OK)
 async def get_leads_wastage(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     cfg = _alert_config(db, current_user.org_id)
@@ -1330,7 +1344,7 @@ def _zombie_leads(db: Session, org_id: str, threshold_days: int = _ZOMBIE_THRESH
 
     zombies = []
     for lead in leads:
-        updated = lead.updated_at or lead.created_at
+        updated = _aware(lead.updated_at or lead.created_at)
         if updated is None:
             continue
         days_stalled = (now - updated).days
@@ -1349,7 +1363,7 @@ def _zombie_leads(db: Session, org_id: str, threshold_days: int = _ZOMBIE_THRESH
 
 @router.get("/leads/zombie", status_code=status.HTTP_200_OK)
 async def get_leads_zombie(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     cfg = _alert_config(db, current_user.org_id)
@@ -1463,7 +1477,7 @@ async def get_lead_detail(
         duplicates = [{"id": d.id, "name": d.name or d.contact_key, "pipeline_stage": d.pipeline_stage} for d in dupes]
 
     now = datetime.now(timezone.utc)
-    updated = (lead.updated_at or lead.created_at) if lead else None
+    updated = _aware((lead.updated_at or lead.created_at) if lead else None)
     days_stuck = max(0, (now - updated).days) if updated else 0
 
     return {
@@ -1494,7 +1508,7 @@ async def get_lead_detail(
 async def update_lead_details(
     lead_id: str,
     body: Dict[str, Any],
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_role("founder", "admin")),
     db: Session = Depends(get_db),
 ):
     """Edits the lead's own fields — name/phone/reason/source/owner/deal value.
@@ -1502,7 +1516,14 @@ async def update_lead_details(
     and its audit trail (LeadStageChange) — mixing the two here would let a
     plain field edit slip a stage change through without that trail. Only
     fields actually present in the body are touched (partial update); an
-    unknown field is a 422, not a silent no-op."""
+    unknown field is a 422, not a silent no-op.
+
+    Founder/admin only — the mobile app never calls this (its own lead edits
+    are a local-only override, never synced here). A plain telecaller token
+    used to be able to reassign any lead in the org to themselves, or edit
+    deal_value on an already-Closed-Won lead, with zero ownership check and
+    zero audit trail (unlike the stage-change path, which logs every move).
+    """
     lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
     if not lead:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
@@ -1520,6 +1541,16 @@ async def update_lead_details(
         )
         if owner is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="assigned_to must be a telecaller on this org")
+
+    # deal_value has no dedicated audit table (unlike pipeline_stage's
+    # LeadStageChange) — a log line is a lightweight trail for "who changed
+    # the revenue number on this lead, and from what", cheap enough not to
+    # warrant a schema migration for what should be a rare, founder-only edit.
+    if "deal_value" in body and body["deal_value"] != lead.deal_value:
+        logger.info(
+            "lead.deal_value changed lead_id=%s org_id=%s by_user=%s from=%s to=%s",
+            lead.id, current_user.org_id, current_user.id, lead.deal_value, body["deal_value"],
+        )
 
     for field in editable:
         if field in body:
@@ -1586,7 +1617,7 @@ async def get_telecaller_performance_detail(
         .order_by(AudioCall.timestamp.desc())
         .first()
     )
-    today_last_call_at = today_last_call.timestamp if today_last_call else None
+    today_last_call_at = _aware(today_last_call.timestamp if today_last_call else None)
     live_status = _telecaller_status(now, today_attendance, today_last_call_at)
     idle_minutes = None
     if today_attendance is not None and today_attendance.check_in_at is not None and today_attendance.check_out_at is None:
