@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user, require_role
@@ -45,7 +46,20 @@ def _today_ist() -> date_type:
 MAX_SHIFT_HOURS = 12
 
 
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalize a DB-sourced datetime to UTC-aware before it's compared
+    against datetime.now(timezone.utc). Postgres' DateTime(timezone=True)
+    columns round-trip aware datetimes in production, but SQLite (the test
+    DB) silently drops tzinfo — without this, _effective_checkout raises
+    "can't subtract offset-naive and offset-aware datetimes" the moment a
+    naive value reaches it."""
+    if dt is None:
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _hours_worked(check_in_at: Optional[datetime], check_out_at: Optional[datetime]) -> Optional[float]:
+    check_in_at, check_out_at = _aware(check_in_at), _aware(check_out_at)
     if check_in_at is None or check_out_at is None:
         return None
     delta = check_out_at - check_in_at
@@ -58,10 +72,11 @@ def _effective_checkout(record: Attendance, now: datetime) -> tuple[Optional[dat
     open shift within the cap is genuinely on-shift (no hours yet)."""
     if record.check_out_at is not None:
         return record.check_out_at, "completed"
-    if record.check_in_at is None:
+    check_in_at = _aware(record.check_in_at)
+    if check_in_at is None:
         return None, "on_shift"
-    if now - record.check_in_at >= timedelta(hours=MAX_SHIFT_HOURS):
-        return record.check_in_at + timedelta(hours=MAX_SHIFT_HOURS), "auto_closed"
+    if now - check_in_at >= timedelta(hours=MAX_SHIFT_HOURS):
+        return check_in_at + timedelta(hours=MAX_SHIFT_HOURS), "auto_closed"
     return None, "on_shift"
 
 
@@ -108,7 +123,17 @@ async def check_in(
     else:
         record.check_in_at = now
 
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Two concurrent check-ins (double-tap, retry-after-timeout, or two
+        # devices) can both read `record is None` above and both try to
+        # insert a row for the same (user_id, date) — the second commit hits
+        # uq_attendance_user_date. Without this, that raised as an unhandled
+        # 500 instead of the 409 the client's "harmless race, just refresh"
+        # retry logic expects.
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Already checked in today")
     db.refresh(record)
     return _to_record_response(record)
 
@@ -164,6 +189,8 @@ async def list_attendance(
         to_date = _today_ist()
     if from_date is None:
         from_date = to_date - timedelta(days=30)
+    if from_date > to_date:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="from_date must not be after to_date")
 
     query = (
         db.query(Attendance, User)
@@ -222,7 +249,7 @@ async def close_own_shift(
         raise HTTPException(status.HTTP_409_CONFLICT, detail="Shift already closed")
 
     now = datetime.now(timezone.utc)
-    capped = record.check_in_at + timedelta(hours=MAX_SHIFT_HOURS)
+    capped = _aware(record.check_in_at) + timedelta(hours=MAX_SHIFT_HOURS)
     record.check_out_at = min(now, capped)
     db.commit()
     db.refresh(record)
@@ -248,10 +275,13 @@ async def correct_attendance(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Attendance record not found")
     if record.check_in_at is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Record has no check-in to close")
-    if body.check_out_at <= record.check_in_at:
+    corrected_check_out = _aware(body.check_out_at)
+    if corrected_check_out <= _aware(record.check_in_at):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Check-out must be after check-in")
+    if corrected_check_out > datetime.now(timezone.utc):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Check-out cannot be in the future")
 
-    record.check_out_at = body.check_out_at
+    record.check_out_at = corrected_check_out
     db.commit()
     db.refresh(record)
     user = db.query(User).filter(User.id == record.user_id).first()
