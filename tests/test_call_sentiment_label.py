@@ -98,9 +98,12 @@ def test_lead_detail_call_history_includes_real_sentiment_label(client, db_sessi
 
     res = client.get("/api/leads/priya", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 200, res.text
-    calls = res.json()["calls"]
-    assert len(calls) == 1
-    assert calls[0]["sentiment"] == "positive"
+    # Founder-facing shape (GET /api/leads/{id_or_contact_key} dispatches by
+    # role — a founder gets dashboard.py's "touchpoints" timeline, not the
+    # mobile app's "calls" shape; see get_lead_detail's docstring).
+    touchpoints = res.json()["touchpoints"]
+    assert len(touchpoints) == 1
+    assert touchpoints[0]["sentiment"] == "positive"
 
 
 def test_lead_detail_call_with_no_sentiment_data_is_none_not_neutral(client, db_session):
@@ -112,4 +115,4 @@ def test_lead_detail_call_with_no_sentiment_data_is_none_not_neutral(client, db_
 
     res = client.get("/api/leads/amit", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 200, res.text
-    assert res.json()["calls"][0]["sentiment"] is None
+    assert res.json()["touchpoints"][0]["sentiment"] is None

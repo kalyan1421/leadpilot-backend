@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user, require_role
@@ -1367,17 +1369,51 @@ async def get_lead_detail(
     same-phone duplicate leads. Aggregation only — no field here is invented;
     a section with nothing behind it (no calls yet, no memory bubble built
     yet, no follow-up scheduled) comes back null/empty rather than faked.
+
+    Also the SOLE route registered at this path shape (`/api/leads/{x}`) —
+    calls.py's `get_lead_detail_for_telecaller` used to be a second,
+    independent route at the identical shape and was silently shadowed by
+    this one (registration order across routers, not path specificity,
+    decides overlapping-shape matches in FastAPI/Starlette). Dispatching on
+    role here, instead of leaving two competing routes, is what actually
+    keeps the mobile app's Lead Detail screen (and `/api/leads/dedupe`,
+    which that same wildcard was also swallowing) reachable — see the
+    docstring on get_lead_detail_for_telecaller for the full story.
     """
+    if current_user.role == "telecaller":
+        from app.api.calls import get_lead_detail_for_telecaller
+
+        return await get_lead_detail_for_telecaller(lead_id, db, current_user)
+
     from app.api.calls import _gather_contact_calls, _serialize_bubble
     from app.models import FollowUp, MemoryBubble
 
-    lead = db.query(Lead).filter(Lead.id == lead_id, Lead.org_id == current_user.org_id).first()
-    if not lead:
+    # Accepts either the board's own `id` (a UUID) or a `contact_key` — the
+    # mobile app and every other lead-scoped endpoint (e.g.
+    # /leads/by-contact/{contact_key}/stage) address a lead by contact_key,
+    # and this must stay reachable that way too, not just from the web
+    # Kanban board's id-based navigation.
+    lead = (
+        db.query(Lead)
+        .filter(Lead.org_id == current_user.org_id)
+        .filter(or_(Lead.id == lead_id, Lead.contact_key == lead_id))
+        .first()
+    )
+    # A call can land (auto-capture/upload) before any formal Lead row exists
+    # — same "works even for a lead with no Lead row yet" contract the
+    # telecaller endpoint already honors. Without this fallback, a founder
+    # opening a contact's detail before a Lead row was ever created 404s even
+    # though there's real call history to show.
+    contact_key = lead.contact_key if lead else lead_id
+    calls = _gather_contact_calls(contact_key, db, current_user.org_id)  # oldest first
+    if not lead and not calls:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
 
-    telecaller = db.query(User).filter(User.id == lead.assigned_to).first() if lead.assigned_to else None
-
-    calls = _gather_contact_calls(lead.contact_key, db, current_user.org_id)  # oldest first
+    telecaller = (
+        db.query(User).filter(User.id == lead.assigned_to).first()
+        if lead and lead.assigned_to
+        else None
+    )
     touchpoints = [
         {
             "call_id": c["call_id"],
@@ -1388,6 +1424,9 @@ async def get_lead_detail(
             # commitments_made, overall_tone} object (see CallSummary in lib/api.ts) —
             # the timeline just needs the one-line headline, not the full object.
             "summary": (c["analysis"]["call_summary"] or {}).get("headline"),
+            # Real per-call sentiment (positive/neutral/negative), not a score
+            # proxy — same field the mobile app's history surfaces.
+            "sentiment": c["analysis"]["sentiment_label"],
         }
         for c in reversed(calls)  # newest first, matching the timeline UI
     ]
@@ -1400,7 +1439,7 @@ async def get_lead_detail(
 
     bubble_row = (
         db.query(MemoryBubble)
-        .filter(MemoryBubble.contact_key == lead.contact_key, MemoryBubble.org_id == current_user.org_id)
+        .filter(MemoryBubble.contact_key == contact_key, MemoryBubble.org_id == current_user.org_id)
         .first()
     )
     memory = _serialize_bubble(bubble_row) if bubble_row else None
@@ -1410,10 +1449,12 @@ async def get_lead_detail(
         .filter(FollowUp.lead_id == lead.id, FollowUp.org_id == current_user.org_id, FollowUp.completed_at.is_(None))
         .order_by(FollowUp.due_at.asc())
         .first()
+        if lead
+        else None
     )
 
     duplicates = []
-    if lead.phone:
+    if lead and lead.phone:
         dupes = (
             db.query(Lead)
             .filter(Lead.org_id == current_user.org_id, Lead.phone == lead.phone, Lead.id != lead.id)
@@ -1422,21 +1463,21 @@ async def get_lead_detail(
         duplicates = [{"id": d.id, "name": d.name or d.contact_key, "pipeline_stage": d.pipeline_stage} for d in dupes]
 
     now = datetime.now(timezone.utc)
-    updated = lead.updated_at or lead.created_at
+    updated = (lead.updated_at or lead.created_at) if lead else None
     days_stuck = max(0, (now - updated).days) if updated else 0
 
     return {
-        "id": lead.id,
-        "name": lead.name or lead.contact_key,
-        "phone": lead.phone,
-        "reason": lead.reason,
-        "source": lead.source,
-        "pipeline_stage": lead.pipeline_stage,
-        "deal_value": lead.deal_value,
+        "id": lead.id if lead else None,
+        "name": (lead.name if lead else None) or contact_key.replace("_", " ").title(),
+        "phone": lead.phone if lead else None,
+        "reason": lead.reason if lead else None,
+        "source": lead.source if lead else None,
+        "pipeline_stage": lead.pipeline_stage if lead else None,
+        "deal_value": lead.deal_value if lead else None,
         "score": latest_score,
         "telecaller_name": telecaller.name if telecaller else None,
         "days_stuck": days_stuck,
-        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+        "created_at": lead.created_at.isoformat() if lead and lead.created_at else None,
         "touchpoints": touchpoints,
         "score_history": score_history,
         "memory": memory,

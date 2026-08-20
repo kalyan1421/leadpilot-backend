@@ -57,14 +57,20 @@ app.add_middleware(
 )
 
 # Include API routers.
-# dashboard_router MUST come before intel_router: both mount under /api, and
-# intel_router's GET /leads/{contact_key} would otherwise greedily match
-# GET /leads/board (treating "board" as a contact key) — same pitfall as the
-# existing /leads/dedupe-before-/leads/{contact_key} ordering below.
+# calls_router/intel_router MUST come before dashboard_router: both mount
+# under /api, and intel_router's static GET /leads/dedupe (and POST /leads)
+# would otherwise be shadowed by dashboard_router's GET /leads/{lead_id} —
+# FastAPI/Starlette resolves an overlapping path shape by registration
+# order across the WHOLE app, not by per-route specificity or which router
+# it came from. (intel_router no longer defines its own /leads/{contact_key}
+# — that wildcard-vs-wildcard collision with dashboard's /leads/{lead_id} is
+# now resolved by a single dispatching handler in dashboard.py's
+# get_lead_detail, keyed on the caller's role, instead of two competing
+# routes silently shadowing each other.)
 app.include_router(auth_router)
-app.include_router(dashboard_router)
 app.include_router(calls_router)
 app.include_router(intel_router)
+app.include_router(dashboard_router)
 app.include_router(team_router)
 app.include_router(attendance_router)
 app.include_router(follow_ups_router)

@@ -1074,6 +1074,7 @@ def _gather_contact_calls(contact_key: str, db: Session, org_id: Optional[str] =
     authenticated org_id yet (mirrors _all_analyses_by_contact's org_id param).
     """
     from app.models import LeadAnalysis
+    from app.utils.lead_intelligence import call_sentiment_label
     from app.utils.memory_bubble import contact_key_from_call_id
 
     # Single join instead of N+1 (full AudioCall scan + per-call LeadAnalysis lookup).
@@ -1109,6 +1110,10 @@ def _gather_contact_calls(contact_key: str, db: Session, org_id: Optional[str] =
                 "bant_breakdown": la.bant_breakdown,
                 "entities": la.entities,
                 "call_summary": la.call_summary,
+                # positive/neutral/negative/None — every caller of this shared
+                # helper (founder web's touchpoints, the mobile-only path)
+                # should see the same real per-call sentiment.
+                "sentiment_label": call_sentiment_label(la.sentiment_arc or []),
             },
         })
     return out
@@ -1753,16 +1758,30 @@ async def create_lead(
     return {"contact_key": contact_key, "name": name, "status": "new", "created": True}
 
 
-@intel_router.get("/leads/{contact_key}", status_code=status.HTTP_200_OK)
-async def get_lead_detail(
+async def get_lead_detail_for_telecaller(
     contact_key: str,
-    db: Session = Depends(get_db),
-    current_user=Depends(_get_current_user),
+    db: Session,
+    current_user,
 ):
     """
-    Everything the Lead Detail screen needs in one call:
+    Everything the mobile Lead Detail screen needs in one call:
     card summary + memory bubble + call history. Works even for a 'New' lead
     that has no calls yet.
+
+    NOT a directly-routed endpoint — dispatched from dashboard.py's
+    `GET /api/leads/{lead_id}`, which is the sole route registered at this
+    path shape (see the comment there for why). This function's own
+    `@intel_router.get("/leads/{contact_key}")` used to be a SEPARATE route
+    at the identical path shape (`/api/leads/{single-segment}`); FastAPI/
+    Starlette resolves overlapping path shapes by registration order, and
+    since dashboard_router is included before calls.py's intel_router (see
+    main.py), that dashboard endpoint silently shadowed this one in
+    production — the mobile app's entire Lead Detail screen (and
+    `/api/leads/dedupe`, matched by the same wildcard) 404'd. Confirmed live
+    via TestClient before this fix. Merging into one dispatching handler,
+    keyed on `current_user.role`, is the only way to keep both response
+    contracts (this one's mobile shape, dashboard's founder-web shape) alive
+    on the one URL both existing, already-released clients call.
 
     Auth required (see get_inbox pattern) — org_id unconditionally scopes the
     lookup, closing the cross-org contact_key-collision risk that existed
