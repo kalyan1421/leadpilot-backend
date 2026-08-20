@@ -27,7 +27,9 @@ def _transcribe_with_retry(path, attempts: int = 3):
     last = None
     for n in range(1, attempts + 1):
         try:
-            return transcribe_file(path)
+            # Reprocessing must preserve the language spoken in the recording;
+            # English remains an on-demand UI translation.
+            return transcribe_file(path, mode="transcribe")
         except Exception as e:                       # noqa: BLE001 — transient network errors
             last = e
             print(f"  transcribe attempt {n}/{attempts} failed: {type(e).__name__}: {e}")

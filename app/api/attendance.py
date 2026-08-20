@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
 from app.models import Attendance, User
+from app.utils.notifications import add_notification
 from app.schemas_attendance import (
     AttendanceCorrectionRequest,
     AttendanceListResponse,
@@ -123,6 +124,17 @@ async def check_in(
     else:
         record.check_in_at = now
 
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="telecaller_checked_in",
+        title="Telecaller checked in",
+        message=f"{current_user.name} checked in for today.",
+        severity="success",
+        entity_type="telecaller",
+        entity_id=current_user.id,
+        actor_name=current_user.name,
+    )
     try:
         db.commit()
     except IntegrityError:
@@ -156,6 +168,17 @@ async def check_out(
         raise HTTPException(status.HTTP_409_CONFLICT, detail="Already checked out today")
 
     record.check_out_at = datetime.now(timezone.utc)
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="telecaller_checked_out",
+        title="Telecaller checked out",
+        message=f"{current_user.name} checked out for today.",
+        severity="info",
+        entity_type="telecaller",
+        entity_id=current_user.id,
+        actor_name=current_user.name,
+    )
     db.commit()
     db.refresh(record)
     return _to_record_response(record)
@@ -251,6 +274,17 @@ async def close_own_shift(
     now = datetime.now(timezone.utc)
     capped = _aware(record.check_in_at) + timedelta(hours=MAX_SHIFT_HOURS)
     record.check_out_at = min(now, capped)
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="telecaller_checked_out",
+        title="Telecaller shift closed",
+        message=f"{current_user.name} closed an open shift.",
+        severity="info",
+        entity_type="telecaller",
+        entity_id=current_user.id,
+        actor_name=current_user.name,
+    )
     db.commit()
     db.refresh(record)
     return _to_record_response(record)

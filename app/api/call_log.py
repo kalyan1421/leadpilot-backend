@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user
 from app.database import get_db
 from app.models import CallLog, Lead, User
+from app.utils.notifications import add_notification
 from app.schemas_call_log import (
     CallLogListResponse,
     CallLogSyncRequest,
@@ -83,6 +84,8 @@ async def sync_call_log(
     }
 
     synced = 0
+    new_entries = 0
+    linked_entries = 0
     for entry in payload.entries:
         claimed = entry.lead_id if entry.lead_id in valid_lead_ids else None
         lead_id = claimed or lead_by_phone.get(entry.phone)
@@ -106,7 +109,25 @@ async def sync_call_log(
                     lead_id=lead_id,
                 )
             )
+            new_entries += 1
+            if lead_id:
+                linked_entries += 1
         synced += 1
+    if new_entries:
+        add_notification(
+            db,
+            org_id=current_user.org_id,
+            notification_type="telecaller_call_activity",
+            title="Telecaller call activity logged",
+            message=(
+                f"{current_user.name} logged {new_entries} new call{'s' if new_entries != 1 else ''}"
+                f"{f' linked to {linked_entries} lead' + ('s' if linked_entries != 1 else '') if linked_entries else ''}."
+            ),
+            severity="info",
+            entity_type="telecaller",
+            entity_id=current_user.id,
+            actor_name=current_user.name,
+        )
     db.commit()
     return CallLogSyncResponse(synced=synced)
 

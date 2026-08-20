@@ -24,6 +24,7 @@ from app.utils.push_notifications import send_push_to_user
 from app.schemas_team import (
     InviteMemberRequest,
     InviteMemberResponse,
+    SendNotificationRequest,
     SetPasswordRequest,
     TeamMemberResponse,
     UpdateMemberRequest,
@@ -265,3 +266,57 @@ async def reset_member_password(
 
     metrics = _member_metrics_batch(db, [user.id])[user.id]
     return InviteMemberResponse(member=_to_member_response(user, metrics), temp_password=new_password)
+
+
+@router.post("/{user_id}/notification", status_code=status.HTTP_200_OK)
+async def send_member_notification(
+    user_id: str,
+    body: SendNotificationRequest,
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    """Sends a founder-authored push to one active telecaller in their org."""
+    user = (
+        db.query(User)
+        .filter(
+            User.id == user_id,
+            User.org_id == current_user.org_id,
+            User.role == "telecaller",
+        )
+        .first()
+    )
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Telecaller not found")
+    if not user.is_active:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="This telecaller account is inactive")
+    if not user.fcm_token:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="No device is registered. Ask the telecaller to open the app and sign in first.",
+        )
+
+    title = body.title.strip()
+    message = body.message.strip()
+    if not title or not message:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Title and message are required")
+
+    sent = send_push_to_user(
+        db,
+        user.id,
+        title=title,
+        body=message,
+        data={"type": "founder_message", "sender_id": current_user.id},
+    )
+    if not sent:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Firebase could not deliver this notification. Check the production Firebase configuration and try again.",
+        )
+
+    logger.info(
+        "founder push sent org_id=%s sender_id=%s recipient_id=%s",
+        current_user.org_id,
+        current_user.id,
+        user.id,
+    )
+    return {"sent": True, "recipient_id": user.id, "recipient_name": user.name}

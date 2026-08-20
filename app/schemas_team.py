@@ -47,3 +47,10 @@ class SetPasswordRequest(BaseModel):
     instead, still one-time-displayed and still forces must_reset_password."""
 
     new_password: Optional[Password] = None
+
+
+class SendNotificationRequest(BaseModel):
+    """Founder-authored, targeted push message for one telecaller."""
+
+    title: str = Field(min_length=1, max_length=80)
+    message: str = Field(min_length=1, max_length=240)

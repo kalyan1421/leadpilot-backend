@@ -68,20 +68,20 @@ def send_push_to_user(
     title: str,
     body: str,
     data: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> bool:
     """Best-effort push to one user's registered device. No-ops quietly if
     the user has no token, Firebase isn't configured, or the send fails —
     see module docstring for why this can never raise into the caller."""
     if not user_id:
-        return
+        return False
     app = _get_app()
     if app is None:
-        return
+        return False
 
     try:
         user = db.query(User).filter(User.id == user_id).first()
         if user is None or not user.fcm_token:
-            return
+            return False
 
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
@@ -89,7 +89,9 @@ def send_push_to_user(
             token=user.fcm_token,
         )
         messaging.send(message, app=app)
+        return True
     except Exception:
         # Covers an expired/unregistered token, a transient FCM outage, or a
         # malformed payload — none of which should surface to the caller.
         logger.exception("Push notification failed for user_id=%s", user_id)
+        return False

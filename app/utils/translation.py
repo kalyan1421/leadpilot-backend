@@ -24,24 +24,25 @@ class Translator(Protocol):
 
 
 class SarvamTranslator:
-    """Sarvam LLM translator. Handles 3-key rotation internally; fails open (returns original)."""
+    """Dedicated Sarvam Indic translator; fails open to the original text."""
 
     def translate(self, text: str, source_lang: str, target_lang: str = "en") -> str:
         if not text.strip():
             return text
-        from app.utils.sarvam import sarvam_chat
-        src = SUPPORTED_LANGS.get(source_lang, source_lang)
-        tgt = SUPPORTED_LANGS.get(target_lang, target_lang)
+        from app.utils.sarvam import sarvam_translate_text
+        src = _provider_language_code(source_lang, allow_auto=True)
+        tgt = _provider_language_code(target_lang)
         try:
-            out = sarvam_chat(
-                [
-                    {"role": "system", "content": f"You are a translator. Translate {src} to {tgt}. "
-                                                   f"Return ONLY the translation, preserving line breaks. No notes."},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.0, max_tokens=2000,
-            )
-            return re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+            translated = [
+                sarvam_translate_text(
+                    chunk,
+                    source_language_code=src,
+                    target_language_code=tgt,
+                )
+                for chunk in _translation_chunks(text)
+            ]
+            out = " ".join(part for part in translated if part).strip()
+            return out or text
         except Exception as e:
             logger.error(f"Sarvam translation failed ({src}->{tgt}): {e}")
             return text  # fail open: show original rather than nothing
@@ -64,46 +65,47 @@ def detect_language(text: str) -> str:
     return "en"
 
 
-_TRANSLATE_SCHEMA = {
-    "type": "object",
-    "properties": {"translations": {"type": "array", "items": {"type": "object", "properties": {
-        "turn": {"type": "integer"}, "text": {"type": "string"}}, "required": ["turn", "text"]}}},
-    "required": ["translations"],
-}
+def _provider_language_code(language: str, *, allow_auto: bool = False) -> str:
+    """Normalise app/ASR language tags to Sarvam's translation API codes."""
+    raw = (language or "").strip()
+    if allow_auto and raw in ("", "unknown", "auto"):
+        return "auto"
+    base = raw.split("-")[0].lower()
+    return f"{base or 'en'}-IN"
+
+
+def _translation_chunks(text: str, max_chars: int = 950) -> List[str]:
+    """Split long text under Mayura's 1,000-character request limit."""
+    remaining = text.strip()
+    chunks: List[str] = []
+    while len(remaining) > max_chars:
+        window = remaining[: max_chars + 1]
+        cut = max(window.rfind(mark) for mark in ("\n", ".", "?", "!", " "))
+        if cut < max_chars // 2:
+            cut = max_chars
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def translate_turns(turns: List[Dict[str, Any]], source_lang: str, target_lang: str = "en") -> List[Dict[str, Any]]:
     """
-    Translate transcript turns in ONE structured (tool-calling) call, aligned by turn number.
-    Reliable on Sarvam's reasoning models (plain-prompt JSON returns empty/garbled). Returns new
-    turns with `content_translated` added — original `content` preserved so the toggle flips instantly.
+    Translate each diarized turn with Sarvam's dedicated Indic translation API.
+    Original content and speaker roles remain untouched so the app can toggle
+    instantly without speaker/turn reassembly errors.
     """
-    from app.utils.sarvam import sarvam_extract
-    texts = [t.get("content", "") for t in turns]
-    if not any(texts):
-        return turns
-    src = SUPPORTED_LANGS.get(source_lang, source_lang)
-    tgt = SUPPORTED_LANGS.get(target_lang, target_lang)
-    numbered = "\n".join(f"{i + 1}. {tx}" for i, tx in enumerate(texts) if tx)
-    by_turn: Dict[int, str] = {}
-    try:
-        out = sarvam_extract(
-            [
-                {"role": "system", "content": f"Translate each numbered line from {src} to natural, faithful {tgt}. "
-                                               f"Return one entry per line, preserving its number. Translate meaning, not transliteration."},
-                {"role": "user", "content": numbered},
-            ],
-            schema=_TRANSLATE_SCHEMA, tool_name="record_translations", max_tokens=4000,
-        )
-        by_turn = {item.get("turn"): item.get("text", "") for item in (out.get("translations") or [])
-                   if isinstance(item.get("turn"), int)}
-    except Exception as e:
-        logger.error(f"translate_turns failed ({src}->{tgt}): {e}")
-
+    translator = get_translator()
     result = []
-    for i, t in enumerate(turns, 1):
+    for t in turns:
         nt = dict(t)
-        nt["content_translated"] = by_turn.get(i) or t.get("content", "")  # fail open to original
+        original = t.get("content", "")
+        nt["content_translated"] = translator.translate(
+            original,
+            source_lang,
+            target_lang,
+        )
         result.append(nt)
     return result
 
@@ -113,31 +115,15 @@ def translate_strings(strings: List[str], target_lang: str = "en") -> List[str]:
     Translate a list of free-text UI strings to `target_lang`, index-aligned, via tool-calling.
     Powers the Score / AI-Summary "View English" toggle. Fails open (returns originals on error).
     """
-    from app.utils.sarvam import sarvam_extract
     items = [(i, s) for i, s in enumerate(strings) if isinstance(s, str) and s.strip()]
     if not items:
         return list(strings)
-    tgt = SUPPORTED_LANGS.get(target_lang, target_lang)
-    numbered = "\n".join(f"{pos}. {s}" for pos, (_, s) in enumerate(items, 1))
-    by_pos: Dict[int, str] = {}
-    try:
-        out = sarvam_extract(
-            [
-                {"role": "system", "content": f"Translate each numbered line to natural, faithful {tgt}. "
-                                               f"Return one entry per line, preserving its number. Meaning, not transliteration. "
-                                               f"If a line is already {tgt}, return it unchanged."},
-                {"role": "user", "content": numbered},
-            ],
-            schema=_TRANSLATE_SCHEMA, tool_name="record_translations", max_tokens=4000,
-        )
-        by_pos = {item.get("turn"): item.get("text", "") for item in (out.get("translations") or [])
-                  if isinstance(item.get("turn"), int)}
-    except Exception as e:
-        logger.error(f"translate_strings failed (->{tgt}): {e}")
+    translator = get_translator()
     result = list(strings)
-    for pos, (orig_idx, _s) in enumerate(items, 1):
-        if by_pos.get(pos):
-            result[orig_idx] = by_pos[pos]
+    for orig_idx, text in items:
+        source_lang = detect_language(text)
+        if source_lang != target_lang:
+            result[orig_idx] = translator.translate(text, source_lang, target_lang)
     return result
 
 

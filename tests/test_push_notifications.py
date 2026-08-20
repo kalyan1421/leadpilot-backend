@@ -12,7 +12,7 @@ concern, not this module's call sites.
 import uuid
 from unittest.mock import patch
 
-from app.models import User
+from app.models import Lead, User
 from app.utils.security import create_access_token, hash_password
 
 
@@ -86,16 +86,18 @@ def test_reassigning_a_lead_pushes_the_new_owner(client, db_session):
         headers=founder_headers,
     )
     lead_id = client.get("/api/leads/board", headers=founder_headers).json()["leads"][0]["id"]
+    assigned_to = db_session.query(Lead).filter(Lead.id == lead_id).one().assigned_to
+    new_owner = tc_b if assigned_to != tc_b.id else tc_a
 
     with patch("app.api.dashboard.send_push_to_user") as mock_push:
         res = client.patch(
             f"/api/leads/{lead_id}/details",
-            json={"assigned_to": tc_b.id},
+            json={"assigned_to": new_owner.id},
             headers=founder_headers,
         )
     assert res.status_code == 200, res.text
     mock_push.assert_called_once()
-    assert mock_push.call_args.args[1] == tc_b.id
+    assert mock_push.call_args.args[1] == new_owner.id
 
 
 def test_founder_moving_a_leads_stage_pushes_its_owner(client, db_session):
@@ -181,3 +183,64 @@ def test_fcm_token_registration_persists_the_token(client, db_session):
 
     user = db_session.query(User).filter(User.id == founder["user"]["id"]).first()
     assert user.fcm_token == "test-device-token-123"
+
+
+def test_founder_can_send_a_custom_notification_to_registered_telecaller(client, db_session):
+    founder = _register_founder(client)
+    org_id = founder["user"]["org_id"]
+    headers = {"Authorization": f"Bearer {founder['access_token']}"}
+    telecaller, _ = _add_telecaller(db_session, org_id, "Priya")
+    telecaller.fcm_token = "registered-device-token"
+    db_session.commit()
+
+    with patch("app.api.team.send_push_to_user", return_value=True) as mock_push:
+        res = client.post(
+            f"/api/team/{telecaller.id}/notification",
+            json={"title": "Team update", "message": "Please review your new leads."},
+            headers=headers,
+        )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["sent"] is True
+    mock_push.assert_called_once_with(
+        db_session,
+        telecaller.id,
+        title="Team update",
+        body="Please review your new leads.",
+        data={"type": "founder_message", "sender_id": founder["user"]["id"]},
+    )
+
+
+def test_custom_notification_explains_when_telecaller_has_no_registered_device(client, db_session):
+    founder = _register_founder(client)
+    org_id = founder["user"]["org_id"]
+    headers = {"Authorization": f"Bearer {founder['access_token']}"}
+    telecaller, _ = _add_telecaller(db_session, org_id)
+
+    with patch("app.api.team.send_push_to_user") as mock_push:
+        res = client.post(
+            f"/api/team/{telecaller.id}/notification",
+            json={"title": "Test", "message": "Push test"},
+            headers=headers,
+        )
+
+    assert res.status_code == 409, res.text
+    assert "No device is registered" in res.json()["detail"]
+    mock_push.assert_not_called()
+
+
+def test_telecaller_cannot_send_custom_notifications(client, db_session):
+    founder = _register_founder(client)
+    org_id = founder["user"]["org_id"]
+    recipient, _ = _add_telecaller(db_session, org_id, "Recipient")
+    recipient.fcm_token = "registered-device-token"
+    _, sender_headers = _add_telecaller(db_session, org_id, "Sender")
+    db_session.commit()
+
+    res = client.post(
+        f"/api/team/{recipient.id}/notification",
+        json={"title": "Not allowed", "message": "Telecaller sender"},
+        headers=sender_headers,
+    )
+
+    assert res.status_code == 403, res.text

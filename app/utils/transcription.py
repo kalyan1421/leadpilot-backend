@@ -22,14 +22,26 @@ class Transcriber(Protocol):
 
 
 class SarvamTranscriber:
-    """Sarvam batch STT + diarization → 2-speaker turns (AGENT/USER) so it renders as a chat."""
+    """Original-language STT + diarization for the saved transcript.
+
+    English is intentionally not generated here. It is requested lazily from
+    the translation endpoint only when the user taps ``View English``.
+    """
 
     def transcribe(self, audio_path: str, language: str | None = None) -> Dict[str, Any]:
         from app.utils.sarvam import transcribe_file
         # 'unknown' lets Sarvam auto-detect Hindi / Telugu / English etc.
         lang_code = "unknown" if not language else (f"{language}-IN" if "-" not in language else language)
         try:
-            return transcribe_file(audio_path, with_diarization=True, num_speakers=2, language_code=lang_code)
+            return transcribe_file(
+                audio_path,
+                # Never let a deployment-level SARVAM_STT_MODE=translate
+                # replace Telugu/Hindi/etc. in the canonical transcript.
+                mode="transcribe",
+                with_diarization=True,
+                num_speakers=2,
+                language_code=lang_code,
+            )
         except Exception as e:
             logger.error(f"Sarvam transcription failed for {audio_path}: {e}", exc_info=True)
             return {"turns": [], "full_text": "", "language": language or "unknown", "quality": "failed", "error": str(e)}

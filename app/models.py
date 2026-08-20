@@ -438,3 +438,29 @@ class LeadStageChange(Base):
         return f"<LeadStageChange(lead_id='{self.lead_id}', {self.from_stage!r}->{self.to_stage!r})>"
 
 
+class Notification(Base):
+    """Persistent founder-facing activity notification.
+
+    Notifications are org-scoped rather than user-scoped because a founder
+    dashboard is an organisation control room: every founder/admin sees the
+    same lead and telecaller events, while read state stays per notification
+    until per-user preferences are needed.
+    """
+
+    __tablename__ = "notifications"
+
+    id = Column(String(255), primary_key=True, index=True)
+    org_id = Column(String(255), ForeignKey("organizations.id"), nullable=False, index=True)
+    type = Column(String(50), nullable=False, index=True)
+    title = Column(String(255), nullable=False)
+    message = Column(Text, nullable=False)
+    severity = Column(String(20), nullable=False, default="info")
+    entity_type = Column(String(50), nullable=True)
+    entity_id = Column(String(255), nullable=True)
+    actor_name = Column(String(255), nullable=True)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    def __repr__(self):
+        return f"<Notification(type='{self.type}', title='{self.title}')>"
+

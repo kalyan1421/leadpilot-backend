@@ -23,6 +23,7 @@ from app.schemas_follow_up import (
     FollowUpResponse,
     FollowUpUpdate,
 )
+from app.utils.notifications import add_notification
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,18 @@ async def create_follow_up(
         due_at=payload.due_at,
     )
     db.add(record)
+    lead = db.query(Lead).filter(Lead.id == payload.lead_id).first() if payload.lead_id else None
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="follow_up_scheduled",
+        title="Follow-up scheduled",
+        message=f"{current_user.name} scheduled a follow-up{f' for {lead.name or lead.contact_key}' if lead else ''}.",
+        severity="info",
+        entity_type="lead" if lead else "telecaller",
+        entity_id=lead.id if lead else current_user.id,
+        actor_name=current_user.name,
+    )
     db.commit()
     db.refresh(record)
     return record
@@ -120,6 +133,7 @@ async def update_follow_up(
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Follow-up not found")
 
+    was_completed = record.completed_at is not None
     if payload.note is not None:
         record.note = payload.note
     if payload.due_at is not None:
@@ -127,6 +141,19 @@ async def update_follow_up(
     if payload.completed is not None:
         record.completed_at = datetime.now(timezone.utc) if payload.completed else None
 
+    if payload.completed is not None and payload.completed != was_completed:
+        lead = db.query(Lead).filter(Lead.id == record.lead_id).first() if record.lead_id else None
+        add_notification(
+            db,
+            org_id=current_user.org_id,
+            notification_type="follow_up_completed" if payload.completed else "follow_up_reopened",
+            title="Follow-up completed" if payload.completed else "Follow-up reopened",
+            message=f"{current_user.name} {'completed' if payload.completed else 'reopened'} a follow-up{f' for {lead.name or lead.contact_key}' if lead else ''}.",
+            severity="success" if payload.completed else "warning",
+            entity_type="lead" if lead else "telecaller",
+            entity_id=lead.id if lead else current_user.id,
+            actor_name=current_user.name,
+        )
     db.commit()
     db.refresh(record)
     return record
@@ -149,5 +176,17 @@ async def delete_follow_up(
     )
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Follow-up not found")
+    lead = db.query(Lead).filter(Lead.id == record.lead_id).first() if record.lead_id else None
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="follow_up_deleted",
+        title="Follow-up removed",
+        message=f"{current_user.name} removed a follow-up{f' for {lead.name or lead.contact_key}' if lead else ''}.",
+        severity="warning",
+        entity_type="lead" if lead else "telecaller",
+        entity_id=lead.id if lead else current_user.id,
+        actor_name=current_user.name,
+    )
     db.delete(record)
     db.commit()
