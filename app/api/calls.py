@@ -272,17 +272,23 @@ async def download_audio(
             detail="No audio file URL available for this call"
         )
     
-    # Local storage mode
-    if settings.storage_mode == "local":
+    # Dispatch on the audio URL's own scheme, not the server's configured
+    # storage_mode. A row can carry a local:// URL even when this server runs
+    # in supabase mode (e.g. it was created by someone running the backend
+    # locally against the shared prod DB) — gating purely on storage_mode
+    # meant those rows 404'd immediately without ever attempting to serve
+    # them, showing "Failed to load call audio" for a recording that may
+    # still be reachable.
+    if call.audio_file_url.startswith("local://") or os.path.exists(call.audio_file_url):
         try:
-            # Check if it's a local:// URL
+            from app.utils.local_storage import local_storage_manager
+
             if call.audio_file_url.startswith("local://"):
-                storage_key = s3_manager.extract_s3_key_from_url(call.audio_file_url)
-                audio_file = s3_manager.download_audio_file(storage_key)
+                storage_key = local_storage_manager.extract_s3_key_from_url(call.audio_file_url)
+                audio_file = local_storage_manager.download_audio_file(storage_key)
                 if audio_file:
-                    # Get extension from the URL
                     file_extension = call.audio_file_url.split('.')[-1] if '.' in call.audio_file_url else 'mp3'
-                    content_type = s3_manager._get_content_type(file_extension)
+                    content_type = local_storage_manager._get_content_type(file_extension)
                     return Response(
                         content=audio_file.read(),
                         media_type=content_type,
@@ -291,17 +297,17 @@ async def download_audio(
                             "Cache-Control": "public, max-age=3600"
                         }
                     )
-            
-            # Check if it's a direct file path
-            if os.path.exists(call.audio_file_url):
+
+            # Direct file path (legacy rows predating the local:// scheme)
+            elif os.path.exists(call.audio_file_url):
                 with open(call.audio_file_url, 'rb') as f:
                     audio_data = f.read()
-                
+
                 file_extension = call.audio_file_url.split('.')[-1] if '.' in call.audio_file_url else 'mp3'
                 if file_extension == 'mpeg':
                     file_extension = 'mp3'
-                content_type = s3_manager._get_content_type(file_extension)
-                
+                content_type = local_storage_manager._get_content_type(file_extension)
+
                 return Response(
                     content=audio_data,
                     media_type=content_type,
@@ -310,28 +316,16 @@ async def download_audio(
                         "Cache-Control": "public, max-age=3600"
                     }
                 )
-            
-            # Try to find the audio file in local storage by call_id
-            audio_path = s3_manager.get_audio_file_path(call_id) if hasattr(s3_manager, 'get_audio_file_path') else None
-            if audio_path and os.path.exists(audio_path):
-                with open(audio_path, 'rb') as f:
-                    audio_data = f.read()
-                file_extension = audio_path.split('.')[-1]
-                content_type = s3_manager._get_content_type(file_extension)
-                return Response(
-                    content=audio_data,
-                    media_type=content_type,
-                    headers={
-                        "Content-Disposition": f"attachment; filename={call_id}.{file_extension}",
-                        "Cache-Control": "public, max-age=3600"
-                    }
-                )
-            
+
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Audio file not found for call {call_id}"
+                detail=(
+                    f"Audio file not found for call {call_id}. This recording was stored on a "
+                    "machine that ran the backend locally and was never uploaded to shared "
+                    "storage — it isn't reachable from this server."
+                )
             )
-            
+
         except HTTPException:
             raise
         except Exception as e:
@@ -340,24 +334,33 @@ async def download_audio(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to serve audio file: {str(e)}"
             )
-    
-    # Supabase Storage mode
-    if settings.storage_mode == "supabase":
+
+    # Supabase Storage
+    if call.audio_file_url.startswith("supabase://"):
         try:
-            if call.audio_file_url.startswith("supabase://"):
-                storage_key = s3_manager.extract_s3_key_from_url(call.audio_file_url)
-                audio_file = s3_manager.download_audio_file(storage_key)
-                if audio_file:
-                    file_extension = call.audio_file_url.split('.')[-1] if '.' in call.audio_file_url else 'mp3'
-                    content_type = s3_manager._get_content_type(file_extension)
-                    return Response(
-                        content=audio_file.read(),
-                        media_type=content_type,
-                        headers={
-                            "Content-Disposition": f"attachment; filename={call_id}.{file_extension}",
-                            "Cache-Control": "public, max-age=3600"
-                        }
-                    )
+            from app.utils.supabase_storage import SupabaseStorageManager
+
+            if isinstance(s3_manager, SupabaseStorageManager):
+                supabase_manager = s3_manager
+            else:
+                # Server isn't configured for supabase mode (e.g. local dev)
+                # but this row still points at Supabase Storage — construct
+                # a manager on demand rather than 404ing without trying.
+                supabase_manager = SupabaseStorageManager()
+
+            storage_key = supabase_manager.extract_s3_key_from_url(call.audio_file_url)
+            audio_file = supabase_manager.download_audio_file(storage_key)
+            if audio_file:
+                file_extension = call.audio_file_url.split('.')[-1] if '.' in call.audio_file_url else 'mp3'
+                content_type = supabase_manager._get_content_type(file_extension)
+                return Response(
+                    content=audio_file.read(),
+                    media_type=content_type,
+                    headers={
+                        "Content-Disposition": f"attachment; filename={call_id}.{file_extension}",
+                        "Cache-Control": "public, max-age=3600"
+                    }
+                )
 
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -366,6 +369,14 @@ async def download_audio(
 
         except HTTPException:
             raise
+        except ValueError as e:
+            # SupabaseStorageManager() raises this when SUPABASE_URL /
+            # SUPABASE_SERVICE_ROLE_KEY aren't configured on this server.
+            logger.error(f"Cannot serve Supabase-stored audio for call {call_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Audio is stored in Supabase Storage but this server isn't configured to reach it: {e}"
+            )
         except Exception as e:
             logger.error(f"Error serving Supabase-stored audio for call {call_id}: {e}")
             raise HTTPException(
@@ -432,6 +443,34 @@ async def download_audio(
         )
 
 
+async def _ensure_semantic_speaker_roles(call: AudioCall, db: Session) -> Dict[str, Any]:
+    """One-time role repair for transcripts stored with the old first-speaker rule."""
+    from app.utils.sarvam import ROLE_MAPPING_VERSION, reclassify_transcript_roles
+
+    transcript = dict(call.transcript or {}) if isinstance(call.transcript, dict) else {}
+    if transcript.get("role_mapping") == ROLE_MAPPING_VERSION:
+        return transcript
+
+    turns = transcript.get("turns") or []
+    speaker_ids = {
+        turn.get("speaker_id")
+        for turn in turns
+        if isinstance(turn, dict) and turn.get("speaker_id") is not None
+    }
+    if len(speaker_ids) < 2:
+        return transcript
+
+    try:
+        transcript["turns"] = await asyncio.to_thread(reclassify_transcript_roles, turns)
+        transcript["role_mapping"] = ROLE_MAPPING_VERSION
+        call.transcript = transcript
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("Could not repair speaker roles for %s: %s", call.call_id, exc)
+    return transcript
+
+
 @router.get("/{call_id}/transcript")
 async def get_transcript(
     call_id: str,
@@ -463,7 +502,8 @@ async def get_transcript(
             detail=f"Call with ID {call_id} not found"
         )
 
-    return {"call_id": call_id, "transcript": call.transcript}
+    transcript = await _ensure_semantic_speaker_roles(call, db)
+    return {"call_id": call_id, "transcript": transcript}
 
 
 
@@ -1637,13 +1677,18 @@ async def get_translated_transcript(
     if not call:
         raise HTTPException(status_code=404, detail=f"Call {call_id} not found")
 
-    transcript = call.transcript or {}
+    transcript = await _ensure_semantic_speaker_roles(call, db)
     turns = transcript.get("turns", []) if isinstance(transcript, dict) else []
     if not turns:
         raise HTTPException(status_code=404, detail="No transcript turns to translate")
 
     sample = " ".join(t.get("content", "") for t in turns[:5])
-    source_lang = detect_language(sample)
+    stored_language = (transcript.get("language") or "").split("-")[0].lower()
+    source_lang = (
+        stored_language
+        if stored_language in SUPPORTED_LANGS and stored_language != "unknown"
+        else detect_language(sample)
+    )
 
     if source_lang == target:
         return {"call_id": call_id, "source_lang": source_lang, "target_lang": target,
@@ -2128,6 +2173,7 @@ def _process_uploaded_recording(call_id: str, audio_path: str):
             "full_text": result.get("full_text", ""),
             "language": result.get("language", "en"),
             "quality": result.get("quality", "ok"),   # preserve STT quality flag (ok|low|failed)
+            "role_mapping": result.get("role_mapping", "semantic_v1"),
             **({"error": result["error"]} if result.get("error") else {}),
         }
         db.commit()

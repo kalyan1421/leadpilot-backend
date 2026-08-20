@@ -17,9 +17,10 @@ from sqlalchemy.orm import Session
 from app.api.attendance import IST, _today_ist
 from app.api.auth import get_current_user, require_role
 from app.database import get_db
-from app.models import Attendance, AudioCall, Lead, LeadAnalysis, LeadStageChange, Organization, User
+from app.models import Attendance, AudioCall, Lead, LeadAnalysis, LeadStageChange, Notification, Organization, User
 from app.utils.lead_intelligence import DEBRIEF_DIMENSIONS, averaged_debrief_dimensions, mmss_to_seconds
 from app.utils.memory_bubble import contact_key_from_call_id
+from app.utils.notifications import add_notification
 from app.utils.push_notifications import send_push_to_user
 
 logger = logging.getLogger(__name__)
@@ -234,6 +235,33 @@ def _log_stage_change(
     )
 
 
+def _notify_stage_change(
+    db: Session,
+    lead: Lead,
+    current_user: User,
+    previous_stage: str,
+) -> None:
+    if lead.pipeline_stage == previous_stage:
+        return
+    stage_copy = {
+        "Interested": ("Lead marked interested", "success"),
+        "Closed Won": ("Lead closed won", "success"),
+        "Closed Lost": ("Lead marked lost", "danger"),
+    }
+    title, severity = stage_copy.get(lead.pipeline_stage, ("Lead stage updated", "info"))
+    add_notification(
+        db,
+        org_id=current_user.org_id,
+        notification_type="lead_stage_changed",
+        title=title,
+        message=f"{lead.name or lead.contact_key} moved from {previous_stage} to {lead.pipeline_stage}.",
+        severity=severity,
+        entity_type="lead",
+        entity_id=lead.id,
+        actor_name=current_user.name,
+    )
+
+
 @router.patch("/leads/{lead_id}/stage", status_code=status.HTTP_200_OK)
 async def update_lead_stage(
     lead_id: str,
@@ -248,6 +276,7 @@ async def update_lead_stage(
     previous_stage = lead.pipeline_stage
     lead = _apply_stage_update(lead, body)
     _log_stage_change(db, lead, current_user, previous_stage, body.get("note"))
+    _notify_stage_change(db, lead, current_user, previous_stage)
     db.commit()
     # This is the by-Lead.id path only the web Kanban calls (the mobile app
     # only ever knows a lead by contact_key, see update_lead_stage_by_contact
@@ -297,6 +326,7 @@ async def update_lead_stage_by_contact(
     previous_stage = lead.pipeline_stage
     lead = _apply_stage_update(lead, body)
     _log_stage_change(db, lead, current_user, previous_stage, body.get("note"))
+    _notify_stage_change(db, lead, current_user, previous_stage)
     db.commit()
     return {
         "contact_key": lead.contact_key,
@@ -1175,6 +1205,81 @@ async def get_dashboard_activity(
 
 
 # ---------------------------------------------------------------------------
+# Founder notification centre — durable event feed for lead and telecaller
+# activity. Insights remain a separate, computed feed under AI Insights.
+# ---------------------------------------------------------------------------
+
+def _serialize_notification(row: Notification) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "type": row.type,
+        "title": row.title,
+        "message": row.message,
+        "severity": row.severity,
+        "entity_type": row.entity_type,
+        "entity_id": row.entity_id,
+        "actor_name": row.actor_name,
+        "created_at": _aware(row.created_at).isoformat() if row.created_at else None,
+        "read_at": _aware(row.read_at).isoformat() if row.read_at else None,
+    }
+
+
+@router.get("/notifications", status_code=status.HTTP_200_OK)
+async def get_notifications(
+    unread_only: bool = False,
+    limit: int = Query(50, ge=1, le=100),
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    query = db.query(Notification).filter(Notification.org_id == current_user.org_id)
+    if unread_only:
+        query = query.filter(Notification.read_at.is_(None))
+    rows = query.order_by(Notification.created_at.desc()).limit(limit).all()
+    unread_count = (
+        db.query(Notification)
+        .filter(Notification.org_id == current_user.org_id, Notification.read_at.is_(None))
+        .count()
+    )
+    return {"notifications": [_serialize_notification(row) for row in rows], "unread_count": unread_count}
+
+
+@router.patch("/notifications/{notification_id}/read", status_code=status.HTTP_200_OK)
+async def mark_notification_read(
+    notification_id: str,
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    row = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id, Notification.org_id == current_user.org_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Notification not found")
+    if row.read_at is None:
+        row.read_at = datetime.now(timezone.utc)
+        db.commit()
+    return _serialize_notification(row)
+
+
+@router.post("/notifications/read-all", status_code=status.HTTP_200_OK)
+async def mark_all_notifications_read(
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(Notification)
+        .filter(Notification.org_id == current_user.org_id, Notification.read_at.is_(None))
+        .all()
+    )
+    now = datetime.now(timezone.utc)
+    for row in rows:
+        row.read_at = now
+    db.commit()
+    return {"marked_read": len(rows)}
+
+
+# ---------------------------------------------------------------------------
 # Lead quality deep-dive
 # ---------------------------------------------------------------------------
 
@@ -1593,6 +1698,7 @@ async def update_lead_details(
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail=f"Lead {lead_id} not found")
 
     previous_assigned_to = lead.assigned_to
+    requested_assigned_to = body.get("assigned_to") if "assigned_to" in body else previous_assigned_to
     editable = {"name", "phone", "reason", "source", "assigned_to", "deal_value"}
     unknown = set(body.keys()) - editable
     if unknown:
@@ -1621,11 +1727,28 @@ async def update_lead_details(
         if field in body:
             setattr(lead, field, body[field])
 
+    if requested_assigned_to != previous_assigned_to:
+        assigned_to = db.query(User).filter(User.id == requested_assigned_to).first() if requested_assigned_to else None
+        add_notification(
+            db,
+            org_id=current_user.org_id,
+            notification_type="lead_assigned" if assigned_to else "lead_unassigned",
+            title="Lead assigned" if assigned_to else "Lead unassigned",
+            message=(
+                f"{lead.name or lead.contact_key} was assigned to {assigned_to.name}."
+                if assigned_to
+                else f"{lead.name or lead.contact_key} no longer has a telecaller assigned."
+            ),
+            severity="info" if assigned_to else "warning",
+            entity_type="lead",
+            entity_id=lead.id,
+            actor_name=current_user.name,
+        )
     db.commit()
     db.refresh(lead)
-    if lead.assigned_to and lead.assigned_to != previous_assigned_to:
+    if requested_assigned_to and requested_assigned_to != previous_assigned_to:
         send_push_to_user(
-            db, lead.assigned_to,
+            db, requested_assigned_to,
             title="New lead assigned",
             body=f"{lead.name or lead.contact_key} has been assigned to you",
             data={"type": "lead_assigned", "lead_id": lead.id},
@@ -1815,6 +1938,79 @@ async def get_telecaller_performance_detail(
         "daily_calls": daily_calls,
         "leads_assigned": leads_assigned,
     }
+
+
+@router.get("/telecallers/performance/{telecaller_id}/calls", status_code=status.HTTP_200_OK)
+async def get_telecaller_call_log(
+    telecaller_id: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+    current_user: User = Depends(require_role("founder", "admin")),
+    db: Session = Depends(get_db),
+):
+    """Paginated call log for one telecaller — the "View all" destination for
+    the Telecaller Detail page's Call Log card, which only shows a handful
+    inline (that inline `timeline` above is hard-capped at 20). Same
+    start/end (YYYY-MM-DD, inclusive) convention as the detail endpoint
+    above; omit both for all-time."""
+    s = _parse_snapshot_date(start, field="start")
+    e = _parse_snapshot_date(end, field="end")
+    if e is not None:
+        e = e + timedelta(days=1)
+    if s is not None and e is not None and e <= s:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="end must be on or after start")
+
+    telecaller = (
+        db.query(User)
+        .filter(User.id == telecaller_id, User.org_id == current_user.org_id, User.role == "telecaller")
+        .first()
+    )
+    if telecaller is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Telecaller not found")
+
+    limit = max(1, min(limit, 100))
+    skip = max(0, skip)
+
+    calls_query = db.query(AudioCall).filter(
+        AudioCall.telecaller_id == telecaller_id, AudioCall.org_id == current_user.org_id
+    )
+    if s is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp >= s)
+    if e is not None:
+        calls_query = calls_query.filter(AudioCall.timestamp < e)
+
+    total = calls_query.count()
+    calls = calls_query.order_by(AudioCall.timestamp.desc()).offset(skip).limit(limit).all()
+
+    call_ids = [c.call_id for c in calls]
+    analyses = (
+        {
+            a.call_id: a
+            for a in db.query(LeadAnalysis)
+            .filter(LeadAnalysis.call_id.in_(call_ids), LeadAnalysis.status == "completed")
+            .all()
+        }
+        if call_ids
+        else {}
+    )
+
+    items = [
+        {
+            "call_id": c.call_id,
+            "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+            "lead_verdict": analyses[c.call_id].lead_verdict if c.call_id in analyses else None,
+            "total_score": (
+                analyses[c.call_id].agent_debrief.get("total_score")
+                if c.call_id in analyses and isinstance(analyses[c.call_id].agent_debrief, dict)
+                else None
+            ),
+        }
+        for c in calls
+    ]
+
+    return {"calls": items, "total": total, "skip": skip, "limit": limit}
 
 
 # ---------------------------------------------------------------------------

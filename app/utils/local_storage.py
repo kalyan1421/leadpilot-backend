@@ -235,5 +235,9 @@ class LocalStorageManager:
         return self._detect_audio_format(file_path)
 
 
-# Global local storage manager instance
-local_storage_manager = LocalStorageManager() if settings.storage_mode == "local" else None
+# Global local storage manager instance. Always constructed (not gated on
+# settings.storage_mode) — it's cheap (just ensures a local directory exists)
+# and app/api/calls.py needs it to serve local:// audio even when the server
+# itself is configured for supabase/s3 storage, e.g. a call row created by
+# someone who ran the backend locally against the shared prod DB.
+local_storage_manager = LocalStorageManager()
