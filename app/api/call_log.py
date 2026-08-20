@@ -54,6 +54,22 @@ async def sync_call_log(
             Lead.org_id == current_user.org_id, Lead.phone.in_(phones)
         )
     }
+    # entry.lead_id is client-supplied and was previously trusted verbatim
+    # with no ownership check — a malformed or malicious client could link a
+    # call-log row to an arbitrary lead id from another org. Only accept it
+    # when it actually names a lead in the caller's own org; otherwise fall
+    # back to the phone-based match like an entry with no lead_id at all.
+    claimed_lead_ids = {e.lead_id for e in payload.entries if e.lead_id}
+    valid_lead_ids = (
+        {
+            row.id
+            for row in db.query(Lead.id).filter(
+                Lead.org_id == current_user.org_id, Lead.id.in_(claimed_lead_ids)
+            )
+        }
+        if claimed_lead_ids
+        else set()
+    )
 
     # Manual upsert (not a DB-level ON CONFLICT) so this works identically
     # against the SQLite test DB and production Postgres — same convention
@@ -68,7 +84,8 @@ async def sync_call_log(
 
     synced = 0
     for entry in payload.entries:
-        lead_id = entry.lead_id or lead_by_phone.get(entry.phone)
+        claimed = entry.lead_id if entry.lead_id in valid_lead_ids else None
+        lead_id = claimed or lead_by_phone.get(entry.phone)
         row = existing_by_device_id.get(entry.device_call_id)
         if row is not None:
             row.duration_seconds = entry.duration_seconds

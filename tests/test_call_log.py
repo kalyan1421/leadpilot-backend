@@ -127,3 +127,50 @@ def test_sync_resolves_lead_id_by_phone_match(client):
     )
     listed = client.get("/api/call-log", headers=headers).json()
     assert listed["calls"][0]["lead_id"] is not None
+
+
+# Regression cover: entry.lead_id was trusted verbatim with no check that it
+# actually belongs to the caller's own org — a malformed or malicious client
+# could link a call-log row to an arbitrary lead id, an IDOR-style linkage
+# risk depending on how consuming endpoints join on lead_id.
+
+
+def test_sync_ignores_a_lead_id_from_another_org(client):
+    headers_a = _auth_headers(client)
+    headers_b = {"Authorization": f"Bearer {_register_founder(client, email='b@example.com', org_name='OrgB')['access_token']}"}
+
+    other_org_lead = client.post(
+        "/api/leads",
+        headers=headers_b,
+        json={"name": "Not Yours", "phone": "+911111111111", "source": "organic", "reason": "x"},
+    ).json()
+    other_org_lead_id = client.get("/api/leads/board", headers=headers_b).json()["leads"][0]["id"]
+
+    res = client.post(
+        "/api/call-log/sync",
+        headers=headers_a,
+        json={"entries": [{**_entry("dev-cross-org", phone="+912222222222"), "lead_id": other_org_lead_id}]},
+    )
+    assert res.status_code == 200, res.text
+
+    listed = client.get("/api/call-log", headers=headers_a).json()
+    assert listed["calls"][0]["lead_id"] is None, "a lead id from another org must not be linked"
+
+
+def test_sync_accepts_a_lead_id_that_actually_belongs_to_the_caller(client):
+    headers = _auth_headers(client)
+    client.post(
+        "/api/leads", headers=headers,
+        json={"name": "Own Lead", "phone": "+913333333333", "source": "organic", "reason": "x"},
+    )
+    own_lead_id = client.get("/api/leads/board", headers=headers).json()["leads"][0]["id"]
+
+    res = client.post(
+        "/api/call-log/sync",
+        headers=headers,
+        json={"entries": [{**_entry("dev-own-org", phone="+914444444444"), "lead_id": own_lead_id}]},
+    )
+    assert res.status_code == 200, res.text
+
+    listed = client.get("/api/call-log", headers=headers).json()
+    assert listed["calls"][0]["lead_id"] == own_lead_id
