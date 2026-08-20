@@ -11,6 +11,7 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -147,7 +148,16 @@ async def register(request: Request, body: RegisterRequest, db: Session = Depend
         role="founder",
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The email-uniqueness pre-check above is TOCTOU against this commit
+        # — two concurrent registrations with the same email can both pass
+        # it before either commits. Without this, the loser's IntegrityError
+        # propagated as an unhandled 500 instead of the same 409 the
+        # pre-check already returns for the non-racing case.
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="Email already registered")
     db.refresh(user)
 
     token = create_access_token({"sub": user.id, "org_id": user.org_id, "role": user.role})

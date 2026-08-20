@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.auth import require_role
@@ -167,7 +168,19 @@ async def invite_member(
         must_reset_password=True,
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The pre-checks above (email/phone uniqueness) are TOCTOU against
+        # this commit — two concurrent invites for the same email/phone can
+        # both pass them before either commits. Without this, the loser's
+        # IntegrityError propagated as an unhandled 500 instead of the same
+        # 409 the pre-checks already return for the non-racing case.
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="This email or phone number is already registered.",
+        )
     db.refresh(user)
 
     # A brand-new invite has no calls/leads/scores yet — skip the metrics queries.
