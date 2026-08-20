@@ -166,3 +166,41 @@ def test_register_duplicate_email_case_insensitive_is_rejected(client):
         json={"org_name": "Other Org", "name": "Someone Else", "email": "DUPE@example.com", "password": "AnotherPass123!"},
     )
     assert res.status_code == 409
+
+
+# Regression cover: bcrypt.checkpw() raises ValueError (doesn't truncate) on
+# a password over 72 BYTES. login/change-password's password fields had no
+# length cap (unlike register/reset's Password type), so pasting a long
+# string in — no malice needed — crashed with an unhandled 500 instead of a
+# clean 4xx.
+
+
+def test_login_with_an_over_72_byte_password_returns_a_clean_error_not_500(client):
+    _register_founder(client, email="longpw@example.com")
+    res = _login(client, "longpw@example.com", "x" * 100)
+    assert res.status_code in (401, 422), res.text
+
+
+def test_change_password_with_an_over_72_byte_current_password_returns_a_clean_error(client):
+    founder = _register_founder(client, email="longpw2@example.com")
+    res = client.post(
+        "/api/auth/change-password",
+        headers={"Authorization": f"Bearer {founder['access_token']}"},
+        json={"current_password": "x" * 100, "new_password": "NewValidPass123!"},
+    )
+    assert res.status_code in (401, 422), res.text
+
+
+def test_register_with_an_over_72_byte_password_returns_a_clean_422_not_500(client):
+    """A pre-existing, separate bug this same fix also closes: the custom
+    validation_exception_handler in main.py (added to scrub plaintext
+    passwords from 422 bodies) left Pydantic's `ctx` key untouched — for a
+    ValueError-raising AfterValidator (the same 72-byte check Password
+    already had), `ctx` holds the exception OBJECT, not a string, which
+    crashed json.dumps inside the handler itself. This affected register/
+    reset-password even before BcryptSafeString existed."""
+    res = client.post(
+        "/api/auth/register",
+        json={"org_name": "Acme", "name": "Founder", "email": "toolong@example.com", "password": "x" * 100},
+    )
+    assert res.status_code == 422, res.text

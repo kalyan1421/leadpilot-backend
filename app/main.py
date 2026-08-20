@@ -130,12 +130,24 @@ async def validation_exception_handler(request, exc: RequestValidationError):
     error dicts include an "input" key by default — for a too-short or
     too-long password on register/change-password/reset-password, that
     default behavior echoed the user's plaintext password back in the 422
-    response body."""
+    response body.
+
+    Also drops "ctx" (or stringifies it) when it's not JSON-serializable —
+    a `ValueError`-raising AfterValidator (e.g. the bcrypt 72-byte length
+    check on Password/BcryptSafeString) produces a `ctx: {"error":
+    ValueError(...)}` entry: a real exception OBJECT, not a string.
+    json.dumps can't serialize that, so any such validation failure crashed
+    with an unhandled 500 from INSIDE this error handler itself — the
+    request that should have gotten a clean 422 instead. "msg" already
+    carries the same message as a plain string, so ctx is redundant here
+    anyway.
+    """
     errors = []
     for err in exc.errors():
         err = dict(err)
         if any("password" in str(part).lower() for part in err.get("loc", ())):
             err.pop("input", None)
+        err.pop("ctx", None)
         errors.append(err)
     return JSONResponse(status_code=422, content={"detail": errors})
 

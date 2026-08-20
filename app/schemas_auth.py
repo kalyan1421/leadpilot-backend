@@ -17,6 +17,14 @@ def _within_bcrypt_limit(v: str) -> str:
 # Password with an 8-char floor and a hard 72-byte ceiling (bcrypt's real limit).
 Password = Annotated[str, Field(min_length=8), AfterValidator(_within_bcrypt_limit)]
 
+# Same 72-byte ceiling, no length floor — for verifying an EXISTING password
+# (login, change-password's current_password) rather than setting a new one.
+# bcrypt.checkpw() raises ValueError (doesn't truncate) on an over-limit
+# input; without this cap that propagated as an unhandled 500 instead of a
+# clean 401/422, reachable by simply pasting a long string into the password
+# field (no malice needed).
+BcryptSafeString = Annotated[str, AfterValidator(_within_bcrypt_limit)]
+
 
 class RegisterRequest(BaseModel):
     """First user of a brand-new org — creates both the org and the founder account."""
@@ -29,7 +37,7 @@ class RegisterRequest(BaseModel):
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: BcryptSafeString
 
 
 class UserResponse(BaseModel):
@@ -52,7 +60,7 @@ class TokenResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str
+    current_password: BcryptSafeString
     new_password: Password
 
 
