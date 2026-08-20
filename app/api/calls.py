@@ -30,6 +30,33 @@ _ALLOWED_UPLOAD_EXTENSIONS = {
     "mp3", "mpeg", "m4a", "wav", "aac", "ogg", "flac", "amr", "3gp", "mp4",
 }
 
+# A real call recording is minutes of compressed audio — a few MB at most.
+# 200MB comfortably covers a very long/high-bitrate call with headroom, while
+# still bounding how much memory (and later, LLM/storage cost) a single
+# upload can force the server to commit; there was previously no cap at all.
+_MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int = _MAX_UPLOAD_BYTES) -> bytes:
+    """Reads an UploadFile in chunks, aborting with a 413 as soon as the cap
+    is exceeded — rather than `await file.read()`'s unbounded single
+    allocation, which reads the entire body into memory regardless of size
+    before there's any chance to reject it."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"Recording exceeds the {max_bytes // (1024 * 1024)}MB upload limit.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 # Aggregate / cross-call intelligence lives on its own prefixes so it never
 # collides with the dynamic /api/calls/{call_id} route.
 intel_router = APIRouter(prefix="/api", tags=["intelligence"])
@@ -2285,7 +2312,7 @@ async def upload_recording(
     org_id = current_user.org_id
     telecaller_id = current_user.id
 
-    file_bytes = await file.read()
+    file_bytes = await _read_upload_capped(file)
 
     # Reject an unsupported format up front instead of letting it run the full
     # storage -> transcription pipeline only to die deep inside as an opaque
