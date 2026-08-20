@@ -155,19 +155,45 @@ def _apply_stage_update(lead: Lead, body: Dict[str, Any]) -> Lead:
         lead.closed_at = datetime.now(timezone.utc)
         deal_value = body.get("deal_value")
         if deal_value is not None:
-            lead.deal_value = int(deal_value)
+            lead.deal_value = _validated_amount("deal_value", deal_value)
         # Discount/margin tracking (PRD Layer 4-C) — only meaningful alongside
         # a Closed Won deal_value, so both are only ever set on this branch.
         list_price = body.get("list_price")
         if list_price is not None:
-            lead.list_price = int(list_price)
+            lead.list_price = _validated_amount("list_price", list_price)
         discount_pct = body.get("discount_pct")
         if discount_pct is not None:
-            lead.discount_pct = float(discount_pct)
+            lead.discount_pct = _validated_discount_pct(discount_pct)
     else:
         lead.closed_at = None
 
     return lead
+
+
+def _validated_amount(field: str, value: Any) -> int:
+    """deal_value/list_price go straight into revenue/margin figures on the
+    dashboard — this endpoint takes a raw untyped dict body (no Pydantic
+    schema), so `int(value)` on a non-numeric or negative input used to
+    raise an uncaught ValueError/TypeError (an unhandled 500) instead of a
+    clean 422, and there was no floor stopping a negative amount from
+    silently corrupting those figures."""
+    try:
+        amount = int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field} must be a whole number")
+    if amount < 0:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{field} must not be negative")
+    return amount
+
+
+def _validated_discount_pct(value: Any) -> float:
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="discount_pct must be a number")
+    if not (0 <= pct <= 100):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="discount_pct must be between 0 and 100")
+    return pct
 
 
 def _log_stage_change(

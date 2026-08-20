@@ -189,3 +189,50 @@ def test_lead_card_without_created_at_is_still_valid():
     card = lead_card("x", [])
     assert card["created_at"] is None
     assert card["last_call_at"] is None
+
+
+# ── deal_value/list_price/discount_pct validation ──────────────────────────
+# This endpoint takes a raw untyped dict body (no Pydantic schema) — a
+# non-numeric or negative value used to raise an uncaught ValueError/
+# TypeError (an unhandled 500) instead of a clean 422.
+
+def test_non_numeric_deal_value_is_rejected_with_422_not_500():
+    lead = _lead("Negotiation")
+    with pytest.raises(HTTPException) as exc_info:
+        _apply_stage_update(lead, {"stage": "Closed Won", "deal_value": "not-a-number"})
+    assert exc_info.value.status_code == 422
+
+
+def test_negative_deal_value_is_rejected():
+    lead = _lead("Negotiation")
+    with pytest.raises(HTTPException) as exc_info:
+        _apply_stage_update(lead, {"stage": "Closed Won", "deal_value": -500})
+    assert exc_info.value.status_code == 422
+
+
+def test_discount_pct_over_100_is_rejected():
+    lead = _lead("Negotiation")
+    with pytest.raises(HTTPException) as exc_info:
+        _apply_stage_update(
+            lead, {"stage": "Closed Won", "deal_value": 1000, "list_price": 2000, "discount_pct": 150}
+        )
+    assert exc_info.value.status_code == 422
+
+
+def test_negative_discount_pct_is_rejected():
+    lead = _lead("Negotiation")
+    with pytest.raises(HTTPException) as exc_info:
+        _apply_stage_update(
+            lead, {"stage": "Closed Won", "deal_value": 1000, "list_price": 2000, "discount_pct": -10}
+        )
+    assert exc_info.value.status_code == 422
+
+
+def test_valid_discount_pct_boundary_values_are_accepted():
+    lead = _lead("Negotiation")
+    _apply_stage_update(lead, {"stage": "Closed Won", "deal_value": 1000, "discount_pct": 0})
+    assert lead.discount_pct == 0
+
+    lead2 = _lead("Negotiation")
+    _apply_stage_update(lead2, {"stage": "Closed Won", "deal_value": 1000, "discount_pct": 100})
+    assert lead2.discount_pct == 100
