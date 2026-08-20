@@ -8,7 +8,7 @@ data. This gives the telecaller app somewhere real to sync to.
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -62,6 +62,30 @@ async def create_follow_up(
         )
         if lead_exists is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+
+    # No client-supplied idempotency key exists yet (would need a mobile app
+    # change + a new column), so this schedules(lead_id, due_at) request had
+    # no way to tell "the identical request, retried after a timeout" apart
+    # from "the telecaller really did mean to add a second reminder for the
+    # exact same lead at the exact same minute" — a retried request after a
+    # timeout where the first one actually succeeded silently duplicated the
+    # follow-up, directly polluting the founder dashboard's missed-follow-up
+    # leakage metric this module exists to feed. A short window is enough to
+    # catch a retry without merging two follow-ups a telecaller deliberately
+    # scheduled minutes apart for the same lead.
+    recent_duplicate = (
+        db.query(FollowUp)
+        .filter(
+            FollowUp.org_id == current_user.org_id,
+            FollowUp.telecaller_id == current_user.id,
+            FollowUp.lead_id == payload.lead_id,
+            FollowUp.due_at == payload.due_at,
+            FollowUp.created_at >= datetime.now(timezone.utc) - timedelta(seconds=30),
+        )
+        .first()
+    )
+    if recent_duplicate is not None:
+        return recent_duplicate
 
     record = FollowUp(
         id=str(uuid.uuid4()),
